@@ -1,0 +1,56 @@
+SO
+==
+
+* Please refer to the /documentation/HOW_TO_WORK_WITH_5GR-SO for a more exhaustive description
+
+Requirements
+============
+* Python 3.5.2+
+* pip3
+* osm python lib
+to install osm python lib:
+from folder 5Gr-SO/coreMano/osmclient/
+run:
+	sudo python3 setup.py install
+note: this library was downloaded from
+https://osm.etsi.org/gerrit/osm/osmclient.git on date 09/28/2018
+and the following files were modified:
+scripts/osm.py
+sol005/ns.py
+v1/ns.py
+* MongoDB, just running, no configuration needed.
+
+Install
+=======
+
+git clone https://5growth.eu/git/5growth.5gr-so
+in folder: /5Gr-SO --> pip3 install -r requirements.txt #only the first time
+in folder: /5Gr-SO/coreMano/osmclient/ --> python3 setup.py install
+
+Configuration files
+===================
+Check values in the following configuration files:
+
+5Gr-SO/mtp.properties
+5Gr-SO/db/db.properties
+5Gr-SO/coreMano/coreMano.properties
+5Gr-SO/sm/rooe/rooe.properties
+
+Usage
+=====
+To run the server, execute the following from the "5Gr-SO/nbi/python-flask-server" directory:
+
+pip3 install -r requirements.txt  # only the first time
+python3 -m swagger_server
+
+by open your browser to here:
+
+http://localhost:8080/5gt/so/v1/ui/
+
+you can check all operations definitions and test them.
+
+Tests
+=====
+
+from the "5Gr-SO/test" folder run:
+python regression_test.py

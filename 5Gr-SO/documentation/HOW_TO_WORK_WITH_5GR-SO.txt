@@ -1,0 +1,120 @@
+HOW TO WORK WITH 5GR-SO
+------------------------------
+
+Requirements
+============
+* Python 3.5.2+
+* pip3
+* osm python lib
+
+* MongoDB, just running, no configuration needed.
+* A MANO platform running at your computer. Current supported MANO platforms are: OSM and Cloudify 
+  * OSM R3, R4 or R5. Full support for OSM R3. 
+      OSM R3 installation guide: https://osm.etsi.org/wikipub/index.php/OSM_Release_THREE
+      OSM R4 installation guide: https://osm.etsi.org/wikipub/index.php/OSM_Release_FOUR
+      OSM R5 installation guide: https://osm.etsi.org/wikipub/index.php/OSM_Release_FIVE
+  * Cloudify. Version 4.5 or above.
+      Cloudify installation guide: https://docs.cloudify.co/4.5.0/install_maintain/installation/manager-image/
+      After Cloudify installation open Cloudify Dashboard and choose Cloudify Catalog-> Plugins Catalog 
+      press download OpenStack plugin
+
+    Cloudify plugin for MTP it is still in testing phase and it will be provided when ready. 
+
+* If you are running the 5Gr-SO with OSM you need an available OpenStack instance.
+* Currently, if you are running the 5Gr-SO with Cloudify you need an available OpenStack instance.
+
+* From 5Growth-R1, the enhancements provided by I4 requires the installation of Apache Spark and Apache Livy to 
+the AIML model evaluation. To install it, please follow the next instructions: 
+
+•	Apache Spark
+	* This software allows running jobs to ingest the data from the provided Kafka topic (as source of data) and evaluate them 
+	according to a pretrained model. This is the main duty in R1.
+	* Installation: Please refer to the steps in the following link: https://www.roseindia.net/spark/install-spark-on-ubuntu-18.04.shtml
+	* Comments on installation/configuration:
+	  * The tested Spark distribution is the 2.4.5 (Feb 05 2020), pre-built for Apache Hadoop 2.7
+	  * Executed with the following order (from inside Spark folder), to avoid collision between used ports of 5Growth platform: 
+	    SPARK_MASTER_WEBUI_PORT=9000 ./sbin/start-all.sh
+	  * When executing, you can access a GUI in the port 9000 (if you have used this one launching it).
+
+•	Apache Livy
+	* This library provides a REST API to interact with Apache spark with requests that can be sent from a Python program.
+	* Installation: Please refer to the steps in the following link: https://livy.apache.org/get-started/
+	* Comments on installation/configuration:
+	  * Download the zip file from https://livy.apache.org/download/ . No need for downloading the source files
+	  * Only it is needed to export the SPARK_HOME variable. It should point to the folder of your spark installation (see previous sections)
+	    export SPARK_HOME=/path/to/your/spark/installation
+	  * Before starting livy, you need to edit the /conf/livy.conf.template to add in the “livy.file.local-dir-whitelist” variable the path in your system where you will store the jar files that spark will use. 
+	    In our case is the path to the folder spark_streaming_jobs
+	  * Tip: This software has been installed in the machine where Spark software is running
+	  * When executing, you can access a GUI in the port 8998
+
+Install
+=======
+
+git clone https://5growth.eu/git/5growth.5gr-so
+* In folder /5Gr-SO execute pip3 install -r requirements.txt  # only the first time, to install required libraries
+
+* To install osm python lib:
+  from folder 5Gr-SO/coreMano/osmclient/
+  run:
+	sudo python3 setup.py install
+  NOTE: 1) this library was downloaded from https://osm.etsi.org/gerrit/osm/osmclient.git on date 09/28/2018
+        and the following files were modified:
+        scripts/osm.py
+        sol005/ns.py
+        v1/ns.py
+        2) If you use OSM, you need to register your Openstack instance. This can be done easily with the client and it is explained in the OSM Rx installation guide previously
+           referred
+
+
+Configuration files
+===================
+Check values in the following configuration files:
+
+5Gr-SO/mtp.properties
+    -> to configure the mtp properties
+5Gr-SO/db/db.properties
+    -> to configure the mongo db properties
+5Gr-SO/coreMano/coreMano.properties
+    -> to configure the required parameters for the MANO platform (either OSM or Cloudify)
+5Gr-SO/sm/rooe/rooe.properties
+    -> to configure the parameters of the running PA. PA runs as a separate server from the 5Gr-SO, thus, it has to be previously launched
+5Gr-SO/monitoring/monitoring.properties
+    -> to configure the required parameters for the monitoring and the sla-manager modules of the 5Gr-SO
+5Gr-SO/sm/soe/vs.properties 
+    -> to configure the 5Gr-VS instances considered as possible requesters within the local domain
+5Gr-SO/sm/soe/federation.properties
+    -> to configure the IP address of the possible federated domains
+
+
+Prerequisites (before running)
+====================
+* 5Gr-SO runs with IFA 014 descriptors and MANO platform dependant descriptors. The Network Service Descriptors (NSDs) and its constituent VNF descriptors 
+   need to be available to be instantiated. 
+   IFA descriptors are needed both for VNFs and the NSD. The IFA descriptors can be onboarded at the SM with the NBI following the IFA013 procedure.
+   MANO platform dependant descriptors are generated automatically (translation from IFA descriptors) and onboarded at the corresponding MANO platform 
+   to be able to instantiate the different available Network Services.
+
+Usage
+=====
+To run the server, execute the following from the "5Gr-SO/nbi/python-flask-server" directory:
+
+pip3 install -r requirements.txt  # only the first time
+python3 -m swagger_server
+
+by open your browser to here:
+
+http://localhost:8080/5gt/so/v1/ui/
+
+you can check all NBI operations definitions and test them.
+
+At http://localhost:8080, the user can find the GUI, which supports the defined workflows of the 5Gr-SO. The 5GT-SO_User_Guide.docx file in this folder
+explain all the details of the GUI and all the features supported by the 5Gr-SO.
+
+
+
+
+
+
+
+
