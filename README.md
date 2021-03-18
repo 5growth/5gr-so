@@ -1,3 +1,21 @@
+### Project information
+5GROWTH is funded by the European Union’s Research and Innovation Programme Horizon 2020 under Grant Agreement no. 856709
+
+
+Call: H2020-ICT-2019. Topic: ICT-19-2019. Type of action: RIA. Duration: 30 Months. Start date: 1/6/2019
+
+
+<p align="center">
+<img src="https://upload.wikimedia.org/wikipedia/commons/b/b7/Flag_of_Europe.svg" width="100px" />
+</p>
+
+<p align="center">
+<img src="https://5g-ppp.eu/wp-content/uploads/2019/06/5Growth_rgb_horizontal.png" width="300px" />
+</p>
+ 
+
+
+
 # 5Growth-SO
 
 Release One of 5Growth-SO bases on the Final Release of 5GT-SO (available at: https://github.com/5g-transformer ) and 
@@ -20,12 +38,3 @@ supports the first set of additional innovations provided during the first year 
 ### Support for the 5Growth CI/CD containerized environment (I12)
 - Addition of the Jenkinsfile allowing CI/CD deployments 
 
-
--------------------
-### Project information
-Call: H2020-ICT-2019. Topic: ICT-19-2019. Type of action: RIA. Duration: 30 Months. Start date: 1/6/2019
-![5GROWTH logo](https://5g-ppp.eu/wp-content/uploads/2019/06/5Growth_rgb_horizontal.png)
-
-<p align="center">
-<img src="https://upload.wikimedia.org/wikipedia/commons/b/b7/Flag_of_Europe.svg" width="200px" />
-</p>
