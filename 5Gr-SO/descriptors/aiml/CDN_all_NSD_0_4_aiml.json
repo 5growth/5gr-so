@@ -47,7 +47,7 @@
 			"virtualLinkDf": [{
 				"flavourId": "df_VideoDistribution",
 				"qos": {
-					"latency": 0,
+					"latency": 10,
 					"packetDelayVariation": 0,
 					"packetLossRatio": 0,
 					"priority": 0
@@ -70,7 +70,7 @@
 			"virtualLinkDf": [{
 				"flavourId": "df_mgt",
 				"qos": {
-					"latency": 0,
+					"latency": 10,
 					"packetDelayVariation": 0,
 					"packetLossRatio": 0,
 					"priority": 0
@@ -93,7 +93,7 @@
 			"virtualLinkDf": [{
 				"flavourId": "df_VideoData",
 				"qos": {
-					"latency": 0,
+					"latency": 10,
 					"packetDelayVariation": 0,
 					"packetLossRatio": 0,
 					"priority": 0

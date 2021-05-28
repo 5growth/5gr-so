@@ -35,6 +35,9 @@ import netaddr
 # from coreMano.osm_db import osm_db
 from nbi import log_queue, upload_folder
 from db.nsir_db import nsir_db
+from db.ns_db import ns_db
+from db.nsd_db import nsd_db
+from monitoring.monitoring import wait_commands_execution
 # nothing to append since the code is executed in the folder
 from swagger_server.webserver_utils import ifa014_conversion, ifa011_conversion, create_osm_files
 
@@ -53,7 +56,9 @@ mtp_path = config.get("MTP", "mtp.base_path")
 # load mon properties
 config.read("../../monitoring/monitoring.properties")
 mon_ip = config.get("MONITORING", "monitoring.ip")
-
+mon_port = config.get("MONITORING", "monitoring.port")
+mon_base_path = config.get("MONITORING", "monitoring.base_path")
+mon_pushgateway = config.get("MONITORING", "monitoring.pushgateway")
 
 ########################################################################################################################
 # PRIVATE METHODS COMPUTE                                                                                              #
@@ -153,7 +158,7 @@ def get_information_of_scaled_service_osm(nsi_id, placement_info, osmclient):
             service_vnf_info.append(vnf_info)
     return {"ns_name": nsi_id, "vnfs": service_vnf_info}
 
-def get_information_of_scaled_service_os(nsi_id, placement_info, scale_info):
+def get_information_of_scaled_service_os(nsi_id, placement_info, rvm_agent):
     # this function assumes that the scaled vnfs will be in the same pop as the original one
     # example of placement_info: {"usedNFVIPops": [{"NFVIPoPID": "1", "mappedVNFs": ["webserver", "spr1", "spr21"]}]}
     # example of scale_info: {'scaleVnfType': 'SCALE_OUT', 'vnfIndex': '3', 'vnfName': 'spr21', 'instanceNumber': 2}
@@ -179,7 +184,8 @@ def get_information_of_scaled_service_os(nsi_id, placement_info, scale_info):
                 name = vm['name'].split('-')
                 if (name[0].find('fgt') !=-1 ):
                     # we assume that only 5gt will create this kind of identifiers
-                    ns_id = name[0] + '-' + name[1] + '-' + name[2] + '-' + name[3] + '-' + name[4] + '-' + name[5] 
+                    # ns_id = name[0] + '-' + name[1] + '-' + name[2] + '-' + name[3] + '-' + name[4] + '-' + name[5] 
+                    ns_id = "-".join(name[0:5])
                     if (nsi_id.find(ns_id) != -1): 
                         vnf_info = {}
                         # this is a VNF from the service
@@ -207,8 +213,9 @@ def get_information_of_scaled_service_os(nsi_id, placement_info, scale_info):
                             elem_port_info = {"ip_address": ip_address, "mask": mask, "mac_address": mac_address,
                                              "dc_iface": dc_iface}
                             port_info.append(elem_port_info)
-                        vnf_info = {"name": name[7], "dc": vim['NFVIPoPID'], "port_info": port_info}
-                        vnf_info ["instance"] =  name[8]
+                        vnf_name = "-".join(name[7:len(name)-1])
+                        vnf_info = {"name": vnf_name, "dc": vim['NFVIPoPID'], "port_info": port_info}
+                        vnf_info ["instance"] =  name[len(name)-1]
                         #TO GET floaging IP information
 #                        resource_floating = make_request2('GET', vim_ip, 'http://' + vim_ip +
 #                                            '/compute/v2.1/servers/'+ identifier,
@@ -221,9 +228,12 @@ def get_information_of_scaled_service_os(nsi_id, placement_info, scale_info):
                                 if (iface["OS-EXT-IPS:type"] == "floating") :
                                     floating_ips.append({name[7]: iface["addr"]})
                         vnf_info['floating_ips'] = floating_ips
+                        if (rvm_agent == "yes" and mon_pushgateway == "yes"):
+                            vnf_info["agent_id"] = nsi_id + "-0-" + vnf_info["name"] + "-" + vnf_info["instance"]
                         service_vnf_info.append(vnf_info)
-                        vnf_info ["instance"] =  name[8]
     # in theory is all information to be updated
+    log_queue.put(["DEBUG", "In scaling service vnf info is: "])
+    log_queue.put(["DEBUG", dumps(service_vnf_info)])
     return {"ns_name": nsi_id, "vnfs": service_vnf_info}
 
 
@@ -260,9 +270,11 @@ def get_information_of_deployed_service_os(ns_name, placement_info, osm_release)
                     else:
                         name = vm["name"].split('-')
                         # OSM R5 puts the name of the vdu instead of the vnfname, different to OSMR3
-                        # let's assume the name in the vdu_name is 'vnfname', 
-                        name_bis = name[7]
-                        vnf_name_os = name_bis
+                        # let's assume the name in the vdu_name is 'vnfname',   
+                        # name_bis = name[7]                        
+                        name_bis = name[7:len(name)-1]
+                        #vnf_name_os = name_bis
+                        vnf_name_os = "-".join(name_bis)
 #                    if ((vm["name"].find(ns_name) != -1) and (vm["name"].find(vnf_name) != -1) ):
                     if ((vm["name"].find(ns_name) != -1) and (vnf_name == vnf_name_os) ):
                         port_info = []  # list with each one of the interfaces of the vm
@@ -290,6 +302,7 @@ def get_information_of_deployed_service_os(ns_name, placement_info, osm_release)
                                           "dc_iface": dc_iface}
                             port_info.append(elem_port_info)
                         vnf_info = {"name": vnf_name, "dc": vim["NFVIPoPID"], "port_info": port_info}  # R4
+                        vnf_info ["instance"] =  name[len(name)-1]
                         # TO GET floaging IP information
 #                       resource_floating = make_request2('GET', vim_ip, 'http://' + vim_ip +
 #                                                   '/compute/v2.1/servers/'+ identifier,
@@ -397,8 +410,8 @@ def get_token(ip, user, password):
                                    headers=header)
     # Token is in the response headers
     token = token_response.headers['X-Subject-Token']
-    log_queue.put(["INFO", "In EECOMPUTE, Token is:"])
-    log_queue.put(["INFO", token])
+    #log_queue.put(["INFO", "In EECOMPUTE, Token is:"])
+    #log_queue.put(["INFO", token])
     catalog_endpoint = None
     if 'catalog' in loads(token_response.content.decode('utf-8'))['token']:
         catalog_endpoint = loads(token_response.content.decode('utf-8'))['token']['catalog']
@@ -766,6 +779,478 @@ def deploy_vls_vim(nsId, nsd_json, vnfds_json, instantiationLevel, deployment_fl
     log_queue.put(["INFO", "info_to_create_networks after CREATED in deploy_vls_vim is: %s"%info_to_create_networks])
     return info_to_create_networks
 
+# Function to request rmv_agents scripts to monitoring platform
+def request_rvm_agents_scripts(client, nsd_name, placement_info, nsid):
+    log_queue.put(["INFO", "In request_rvm_agents_scripts to osm: %s" % nsd_name])
+    nsd = client.nsd.get(nsd_name)
+    vnfs = nsd['constituent-vnfd']
+    rvm_scripts = []
+    for NFVIPoPId in placement_info:
+        for mappedvnf in NFVIPoPId['mappedVNFs']:
+            for nsd_vnf in vnfs:
+                if (mappedvnf == nsd_vnf['vnfd-id-ref']):
+                #if (nsd_vnf['vnfd-id-ref'].find(mappedvnf) !=-1):
+                    #agent_id = "None"
+                    agent_id = nsid + "-0-" + mappedvnf + "-" + "1"
+                    body = {
+                               "agent_id": agent_id,
+                               "install_method": "cloud_init",
+                               "description": nsid + '_' + mappedvnf + "_" + "1",
+                               "daemon_user": "ubuntu" #to review, maybe based on "operating system? find ubuntu, windows, ..."
+                           }
+                    agent_info = create_rvm_agent(**body)
+                    # log_queue.put(["DEBUG", "agent_info: %s" % agent_info])
+                    if agent_info is None:
+                        log_queue.put(["ERROR", "the Monitoring platform is not running or the connection configuration is wrong"])
+                    rvm_script = add_spaces(12, agent_info['cloud_init_script'])
+                    script = {  "agent_id": agent_info['agent_id'],
+                                #"rvm_script": agent_info['cloud_init_script'],
+                                "rvm_script": rvm_script,
+                                "member-vnf-index": nsd_vnf["member-vnf-index"],
+                                "vnf": mappedvnf
+                             }
+                    #user_data_content = self.add_spaces(12, user_data_content)
+                    rvm_scripts.append(script)
+                    break
+    return rvm_scripts
+
+def request_rvm_agents_script_scale (nsid, scale_ops):
+    log_queue.put(["INFO", "In request_rvm_agents_scripts SCALE to osm: %s" % nsid])
+    rvm_scripts = []
+    for op in scale_ops:
+        if (op["scaleVnfType"] == "SCALE_OUT"):
+            agent_id = nsid + "-0-" + op["vnfName"] + "-" + str(op["instance"])
+            body = {
+                        "agent_id": agent_id,
+                        "install_method": "cloud_init",
+                        "description": nsid + '_' + op["vnfName"] + "_" + str(op["instance"]),
+                        "daemon_user": "ubuntu" #to review, maybe based on "operating system? find ubuntu, windows, ..."
+                    }
+            agent_info = create_rvm_agent(**body)
+            # log_queue.put(["DEBUG", "agent_info: %s" % agent_info])
+            if agent_info is None:
+                log_queue.put(["ERROR", "the Monitoring platform is not running or the connection configuration is wrong"])
+            rvm_script = add_spaces(12, agent_info['cloud_init_script'])
+            script = {  "agent_id": agent_info['agent_id'],
+                        #"rvm_script": agent_info['cloud_init_script'],
+                        "rvm_script": rvm_script,
+                        "member-vnf-index": op["vnfIndex"],
+                        "vnf": op["vnfName"]
+                     }
+            #user_data_content = self.add_spaces(12, user_data_content)
+            rvm_scripts.append(script)
+    return rvm_scripts
+
+# Function to add spaces to the create the rvm_agent in the monitoring platform (replicated from Cloudify converter)
+def add_spaces(number_of_spaces, script):
+    # return_script_content = " \\n" + " " * number_of_spaces
+    #return_script_content = return_script_content + script.replace("\n", "\\n" + " " * number_of_spaces)
+    return_script_content = script.replace("\n", "\\n")
+    return_script_content = return_script_content.replace("$", "\$")
+    return_script_content = return_script_content.replace('    ','')
+    return_script_content = return_script_content.replace('error:','error')
+    return return_script_content
+
+# Function to create the rvm_agent in the monitoring platform (replicated from Cloudify converter)
+def create_rvm_agent(agent_id=None, install_method="", description="", daemon_user=""):
+    """
+    Contact with the monitoring manager to create the rvm_agent
+    Parameters
+    ----------
+    agent_id: string
+        String identifying
+    install_method: string
+        String identifying the dashboard to be removed
+    description: string
+        String identifying the dashboard to be removed
+    daemon_user: string
+        String identifying the dashboard to be removed
+    Returns
+    -------
+    Dictionary
+    agent_id: string
+        String identifying
+    install_method: string
+        String identifying
+    description: string
+        String identifying
+    cloud_init_script: string
+        String identifying
+    daemon_user: string
+        String identifying
+    """
+
+    header = {'Content-Type': 'application/json',
+              'Accept': 'application/json'}
+    # create the exporter for the job
+    mon_uri = "http://" + mon_ip + ":" + mon_port + mon_base_path + "/agent"
+    body = {
+        "agent_id": agent_id,
+        "install_method": install_method,
+        "description": description,
+        "daemon_user": daemon_user
+        }
+    rvm_agent_info = None
+    try:
+        conn = HTTPConnection(mon_ip, mon_port)
+        conn.request("POST", mon_uri, dumps(body), header)
+        rsp = conn.getresponse()
+        rvm_agent_info = rsp.read()
+        rvm_agent_info = rvm_agent_info.decode("utf-8")
+        rvm_agent_info = loads(rvm_agent_info)
+        conn.close()
+    except ConnectionRefusedError:
+        log_queue.put(["ERROR", "the Monitoring platform is not running or the connection configuration is wrong"])
+    return rvm_agent_info    
+
+# Delete the rvm_agent from the monitoring platform
+def delete_rvm_agent(agent_id):
+    """
+    Contact with the monitoring manager to create the rvm_agent
+    Parameters
+    ----------
+    agent_id: string
+        String identifying the rvm_agent
+    Returns
+    ---------
+    """
+    header = {'Content-Type': 'application/json',
+              'Accept': 'application/json'}
+    # create the exporter for the job
+    mon_uri = "http://" + mon_ip + ":" + mon_port + mon_base_path + "/agent/" + agent_id
+    try:
+        conn = HTTPConnection(mon_ip, mon_port)
+        conn.request("DELETE", mon_uri, None, header)
+        rsp = conn.getresponse()
+        request = rsp.read()
+        request = request.decode("utf-8")
+        request = loads(request)
+        conn.close()
+    except ConnectionRefusedError:
+        log_queue.put(["ERROR", "the Monitoring platform is not running or the connection configuration is wrong"])
+        return request        
+    
+# Function to include the info of the agent_id in the nsr_info
+def add_rvm_agentid_info(nsr_info, additional_params_for_vnf):
+    # this variable to get info of multiple instances of the same VNF
+    vnf_member_index = []
+    for vnf_record in nsr_info:
+        for elem in additional_params_for_vnf:
+            if ((vnf_record["name"] ==  elem["vnf"]) and (elem["member-vnf-index"] not in vnf_member_index)):
+                    vnf_member_index.append(elem["member-vnf-index"])
+                    vnf_record.update({"agent_id": elem["agent_id"]})
+                    break
+    return nsr_info
+
+
+#Function to extract the scripts an replacing with ips
+def getting_nsd_scripts_for_vnfs( ns_descriptor, df_flavour, instantiation_level, map_reference_ip, nsr_info):
+    # we assume that the multiple instances of a VNF are independent, they do not need to communicate nothing to each other
+    vnf_info_script = []
+    # first we get the number of instances of each vnf
+    instances_vnfs = {}
+    for vnf in nsr_info:
+        vnf_name = vnf["name"]    
+        if vnf_name not in instances_vnfs:
+            instances_vnfs.update({vnf_name:1})
+        else:
+            instances_vnfs[vnf_name] = instances_vnfs[vnf_name] + 1
+    # first we get the scripts of the vnfs from the descriptor
+    for df in ns_descriptor["nsDf"]:
+        profiles = []
+        if df["nsDfId"] == df_flavour:
+           for il in df["nsInstantiationLevel"]:
+               if il["nsLevelId"] == instantiation_level:
+                   for vnfp in il["vnfToLevelMapping"]:
+                       profiles.append(vnfp["vnfProfileId"])  
+           break 
+
+    for vnfp in df["vnfProfile"]:
+        if vnfp["vnfProfileId"] in profiles and "script" in vnfp:
+            script_info_elem = {}
+            script_info_elem["name"] = vnfp["vnfdId"]
+            script_info_elem["script"] = vnfp["script"]
+            vnf_info_script.append(script_info_elem)
+       
+    # second, we replace the value of the arguments
+    # For each vnf you should control "target" values and "args" values for all 
+    # possible combinations so it (NxM). For instance, in the case of big vCDN, if
+    # script_target is spr2, you need to generate two scripts and if spr2 addresses
+    # appears in the args, then you need to again duplicate the scripts
+    # The solution here only covers the case of 1 instance of the same VNF in the service       
+    info_scripts = []
+    for vnf in nsr_info:
+        vnf_name = vnf["name"]
+        for elem in vnf_info_script:
+            if (elem["name"] == vnf_name):
+                for script in elem["script"]:
+                    for script_name, script_value in script.items():
+                        if (script_name == "target"):
+                            # if it is a VNF that has multiple instances and it 
+                            # is referring to itself
+                            if ((script_value == vnf_name) and instances_vnfs[vnf_name] > 1):
+                                script_value = vnf["name"] + "-" + vnf["instance"]
+                            else:
+                                continue
+                        for arg_name, arg_value in script_value['args'].items():
+                            arg_parts = arg_value.split(".")
+                            if (arg_parts[0] == "vnf" and arg_parts[6] == "address"):
+                                # this is not a floating IP
+                                if (instances_vnfs[arg_parts[1]] == 1):
+                                   # the only instance, it is in the map
+                                   script_value['args'][arg_name] = map_reference_ip[arg_value]
+                                else:
+                                   # if the value is bigger than 1, at least is has to coincide with 
+                                   # my name
+                                   if (arg_parts[1] == vnf_name):
+                                       arg_parts[1] = vnf["name"] + "-" + vnf["instance"]
+                                       arg_value_bis = ".".join(arg_parts)
+                                       script_value['args'][arg_name] = map_reference_ip[arg_value_bis]
+                            if (arg_parts[0] == "vnf" and arg_parts[6] == "floating"):
+                                if (instances_vnfs[arg_parts[1]] == 1):
+                                   # the only instance, it is in the map
+                                   script_value['args'][arg_name] = map_reference_ip[arg_value]
+                                else:
+                                   # if the value is bigger than 1, at least is has to coincide with 
+                                   # my name, I am not going to interact of other instances of my same type
+                                   # according what we agreed
+                                   if (arg_parts[1] == vnf_name):
+                                       check_key = vnf["name"] + "-" + vnf["instance"]
+                                       for key in map_reference_ip.keys():
+                                           if (key.find(check_key) != -1 and key.find("floating")!=-1):
+                                               script_value['args'][arg_name] = map_reference_ip[key]
+                                               break
+                    info_scripts.append(script)                
+    return info_scripts
+
+def getting_nsd_scripts_for_vnfs_scale( ns_descriptor, df_flavour, instantiation_level, map_reference_ip, nsr_info, scale_ops, scale_mode):
+    # we assume that the multiple instances of a VNF are independent, they do not need to communicate nothing to each other
+    vnf_info_script = []
+    # first we get the number of instances of each vnf
+    instances_vnfs = {}
+    for vnf in nsr_info:
+        vnf_name = vnf["name"]    
+        if vnf_name not in instances_vnfs:
+            instances_vnfs.update({vnf_name:1})
+        else:
+            instances_vnfs[vnf_name] = instances_vnfs[vnf_name] + 1
+    # first we get the scripts of the vnfs from the descriptor
+    for df in ns_descriptor["nsDf"]:
+        profiles = []
+        if df["nsDfId"] == df_flavour:
+           for il in df["nsInstantiationLevel"]:
+               if il["nsLevelId"] == instantiation_level:
+                   for vnfp in il["vnfToLevelMapping"]:
+                       profiles.append(vnfp["vnfProfileId"])  
+           break 
+
+    for vnfp in df["vnfProfile"]:
+        if vnfp["vnfProfileId"] in profiles and "script" in vnfp:
+            script_info_elem = {}
+            script_info_elem["name"] = vnfp["vnfdId"]
+            script_info_elem["script"] = vnfp["script"]
+            vnf_info_script.append(script_info_elem)
+       
+    # second, we replace the value of the arguments
+    # For each vnf you should control "target" values and "args" values for all 
+    # possible combinations so it (NxM). For instance, in the case of big vCDN, if
+    # script_target is spr2, you need to generate two scripts and if spr2 addresses
+    # appears in the args, then you need to again duplicate the scripts
+    # The solution here only covers the case of 1 instance of the same VNF in the service       
+    info_scripts = []
+    for vnf in scale_ops:
+        if vnf["scaleVnfType"] == scale_mode:
+            vnf_name = vnf["vnfName"]
+            for elem in vnf_info_script:
+                if (elem["name"] == vnf_name):
+                    for script in elem["script"]:
+                        for script_name, script_value in script.items():
+                            if (script_name == "target"):
+                                # if it is a VNF that has multiple instances and it 
+                                # is referring to itself
+                                if ((script_value == vnf_name) and instances_vnfs[vnf_name] > 1):
+                                    script_value = vnf["vnfName"] + "-" + vnf["instance"]
+                                else:
+                                    continue
+                            for arg_name, arg_value in script_value['args'].items():
+                                arg_parts = arg_value.split(".")
+                                if (arg_parts[0] == "vnf" and arg_parts[6] == "address"):
+                                    # this is not a floating IP
+                                    if (instances_vnfs[arg_parts[1]] == 1):
+                                       # the only instance, it is in the map
+                                       script_value['args'][arg_name] = map_reference_ip[arg_value]
+                                    else:
+                                       # if the value is bigger than 1, at least is has to coincide with 
+                                       # my name
+                                       if (arg_parts[1] == vnf_name):
+                                           arg_parts[1] = vnf["vnfName"] + "-" + vnf["instance"]
+                                           arg_value_bis = ".".join(arg_parts)                                 
+                                           script_value['args'][arg_name] = map_reference_ip[arg_value_bis]
+                                if (arg_parts[0] == "vnf" and arg_parts[6] == "floating"):
+                                    if (instances_vnfs[arg_parts[1]] == 1):
+                                       # the only instance, it is in the map
+                                       script_value['args'][arg_name] = map_reference_ip[arg_value]
+                                    else:
+                                       # if the value is bigger than 1, at least is has to coincide with 
+                                       # my name, I am not going to interact of other instances of my same type
+                                       # according what we agreed
+                                       if (arg_parts[1] == vnf_name):
+                                           check_key = vnf["vnfName"] + "-" + vnf["instance"]
+                                           for key in map_reference_ip.keys():
+                                               if (key.find(check_key) != -1 and key.find("floating")!=-1):
+                                                   script_value['args'][arg_name] = map_reference_ip[key]
+                                                   break
+                        info_scripts.append(script)                
+    return info_scripts
+
+
+# Function to execute the scripts in the NSD for the different VNFs    
+def execute_nsd_scripts(mode, scripts, vnf_deployed_info):
+    """
+    Terminates the network service identified by nsi_id.
+    Parameters
+    ----------
+    nsi_id: string
+        identifier of the network service instance
+    Returns
+    -------
+    To be defined
+    """
+    """
+    Terminates the network service identified by nsi_id.
+    Parameters
+    ----------
+    nsi_id: string
+        identifier of the network service instance
+    Returns
+    -------
+    To be defined
+    """
+    if mode == 'instantiate':
+        log_queue.put(["INFO", "OSM_WRAPPER: checking scritps for new VNFs instances (instantiate/scale out)"])
+        commands = []
+        for script_elem in scripts:
+            target = script_elem['target']
+            for vnf in vnf_deployed_info:
+                if ("instance" in vnf and vnf["instance"] != "1"):
+                    vnf_name = vnf["name"] + "-" + vnf["instance"]
+                else:
+                    vnf_name = vnf["name"]
+                if (vnf_name == target):
+                    agent_id = vnf['agent_id']
+                    args = list(script_elem['start']['args'].values())
+                    script = script_elem['start']['script']
+                    log_queue.put(["INFO", "In OSM Wrapper, info scripts instantiate mode is: "])
+                    log_queue.put(["INFO", dumps(script, indent=4)])
+                    command = mp_execute_script(agent_id, args=args, env={}, type_message="bash_script", cwd="/tmp", body=script, sync=False)
+                    command.update({"check": True})
+                    commands.append(command)
+        log_queue.put(["INFO", "OSM_WRAPPER: All NSD's scripts are executing at instantiation"])
+        wait_commands_execution(commands)
+        log_queue.put(["INFO", "OSM_WRAPPER: All NSD's scripts were executed at instantiation"])
+    elif mode == 'terminate':
+        log_queue.put(["INFO", "OSM_WRAPPER: checking scripts for old VNFs instances (terminate/scale in)"])
+        commands = []
+        for script_elem in scripts:
+            target = script_elem['target']
+            for vnf in vnf_deployed_info:
+                if ("instance" in vnf and vnf["instance"] != "1"):
+                    vnf_name = vnf["name"] + "-" + vnf["instance"]
+                else:
+                    vnf_name = vnf["name"]
+                if (vnf_name == target):
+                    agent_id = vnf['agent_id']
+                    args = list(script_elem['stop']['args'].values())
+                    script = script_elem['stop']['script']
+                    log_queue.put(["INFO", "In OSM Wrapper, info scripts terminate mode is: "])
+                    log_queue.put(["INFO", dumps(script, indent=4)])
+                    command = mp_execute_script(agent_id, args=args, env={}, type_message="bash_script", cwd="/tmp", body=script, sync=False)
+                    command.update({"check": True})
+                    commands.append(command)
+        wait_commands_execution(commands)
+        log_queue.put(["INFO", "OSM WRAPPER: All NSD's scripts were executed at termination"])
+        
+def mp_execute_script(agent_id, args=[], env={}, type_message="bash_script", cwd="/tmp", body=[], sync=False):
+    """
+    Contact with the monitoring manager to execute script
+    Parameters
+    ----------
+    agent_id: String
+        Agent identifier
+    args: list
+        arguments for the script
+    env: dict
+        String environment variables
+    type_message: string
+        type of script
+    cwd: string
+        work directory
+    body: list
+        contains script
+    sync: boolean
+        True: wait for command execution
+        False: don't wait for command execution
+
+    Returns
+    -------
+    Dictionary with the command status
+    """
+
+    timeout = 600
+    header = {'Content-Type': 'application/json',
+              'Accept': 'application/json'}
+    # create the exporter for the job
+    monitoring_uri = "http://" + mon_ip + ":" + mon_port + mon_base_path + "/agent_command"
+    body = {
+        "agent_id": agent_id,
+        "args": args,
+        "env": env,
+        "type_message": type_message,
+        "cwd": cwd,
+        "body": body
+    }
+    command_info = None
+    try:
+        conn = HTTPConnection(mon_ip, mon_port)
+        conn.request("POST", monitoring_uri, dumps(body), header)
+        rsp = conn.getresponse()
+        command_info = rsp.read()
+        command_info = command_info.decode("utf-8")
+        command_info = loads(command_info)
+    except ConnectionRefusedError:
+        log_queue.put(["ERROR", "the Monitoring platform is not running or the connection configuration is wrong"])
+
+    if sync == True:
+        trequest = time.time()
+        get_command_status = None
+
+        while True:
+            command_id = command_info['command_id']
+            monitoring_uri = "http://" + mon_ip + ":" + mon_port + mon_base_path \
+                             + "/agent_command/" + agent_id + "/" + str(command_id)
+            try:
+                conn = HTTPConnection(mon_ip, mon_port)
+                conn.request("GET", monitoring_uri)
+                rsp = conn.getresponse()
+                get_command_status = rsp.read()
+                get_command_status = get_command_status.decode("utf-8")
+                get_command_status = loads(get_command_status)
+                if rsp.code == 200:
+                    if get_command_status['returncode'] != "0":
+                        raise Exception('Command execution returncode not equal 0 ' \
+                                        + dumps(get_command_status, indent=4))
+                    else:
+                        return get_command_status
+            except ConnectionRefusedError:
+                log_queue.put(
+                   ["ERROR", "the Monitoring platform is not running or the connection configuration is wrong"])
+            time.sleep(5)
+            if (trequest + 300) < time.time():
+                return "Timeout"
+                # raise Exception('Command execution timeout ' + dumps(command_info, indent=4))
+    else:
+        return command_info
+
 
 ########################################################################################################################
 # PRIVATE METHODS OSM                                                                                              #
@@ -782,15 +1267,56 @@ class OsmWrapper(object):
         nsd = self.client.nsd.get(nsd_name)
         vnfs = nsd['constituent-vnfd']
         distribution = []
+        vnf_member_index = []
         for NFVIPoPId in placement_info:
             for mappedvnf in NFVIPoPId['mappedVNFs']:
                 for nsd_vnf in vnfs:
-                    if (mappedvnf == nsd_vnf['vnfd-id-ref']):
+                    if ((mappedvnf == nsd_vnf['vnfd-id-ref']) and \
+                        (nsd_vnf["member-vnf-index"] not in vnf_member_index)):
+                        vnf_member_index.append(nsd_vnf["member-vnf-index"])
                         distrib = {"datacenter": NFVIPoPId['NFVIPoPID'],
                                    "member-vnf-index-ref": nsd_vnf["member-vnf-index"]}
                         distribution.append(distrib)
                         break
         return distribution
+    
+    # Function to adapt the output of the additionalParamsForVnf to the input expected by osmclient
+    def adapt_paramsvnf_to_osm(self, additional_params_for_vnf):
+        log_queue.put(["INFO", "In adapt_paramsvnf_to_osm "])
+        #--config "{additionalParamsForVnf:[{member-vnf-index: '1', additionalParams:{content: '#/bin/bash\ntouch /home/ubuntu/day0_touched.txt'}}]}"
+        additionalParamsForVnf = []
+        for vnf in additional_params_for_vnf:
+            log_queue.put(["INFO","ADAPT PARAMS: %s" % vnf])
+            elem = {}
+            elem["member-vnf-index"] = vnf["member-vnf-index"]
+            elem["additionalParams"] = {"content": vnf["rvm_script"]}
+            #
+            # if (vnf["member-vnf-index"] == "1"):
+            #   #elem["additionalParams"] = {"content": "#!/bin/bash -e\\n touch /home/ubuntu/day0_touched.txt"}
+            #   # no va: elem["additionalParams"] = {"content": "#!/bin/bash -e\\n \# comment\\n touch /home/ubuntu/day0_touched.txt"}
+            #   # va: elem["additionalParams"] = {"content": "#!/bin/bash -e\\n touch /home/ubuntu/day0_touched.txt\\n add_ssl_cert\(\)\\n \{\\n \}\\n"}
+            #   # va: elem["additionalParams"] = {"content": "#!/bin/bash -e\\n touch /home/ubuntu/day0_touched.txt\\n add_ssl_cert()\\n {\\n }\\n"}
+            #   elem["additionalParams"] = {"content": self.removecomments(vnf["rvm_script"])}
+            #   log_queue.put(["INFO", "El content para vnf: %s es %s"%(vnf["member-vnf-index"],type(elem["additionalParams"]["content"]))])
+            # else:
+            #   # log_queue.put(["INFO", "Holaaaaaa!!!!!!!: %s" % vnf["rvm_script"]])
+            #   elem["additionalParams"] = {"content": vnf["rvm_script"]}
+            #   log_queue.put(["INFO", "El content para vnf: %s es %s"%(vnf["member-vnf-index"],type(elem["additionalParams"]["content"]))])
+            # log_queue.put(["INFO", "Holaaaaaa!!!!!!!: %s" % elem["additionalParams"]["content"]])
+            # log_queue.put(["INFO", "ADAPT PARAMS elem: %s" % vnf])
+            additionalParamsForVnf.append(elem)
+        # log_queue.put(["INFO", "ADAPT PARAMS result: %s" % additionalParamsForVnf])
+        return additionalParamsForVnf
+    
+    def removecomments(self, script):
+        content = script
+        content = content.replace("# Download and execute the script that will take care of the agent installation\\n", "")
+        content = content.replace("# Create all the directories in the path to the cert file\\n", "")
+        content = content.replace("# Create a temp directory and cd into it\\n", "")
+        content = content.replace("# If using `sudo` the script is running as a user, and there's no need\\n", "")
+        content = content.replace("# to use `su`. If running as root, `su` as the user, otherwise the cert\\n", "")
+        content = content.replace("# dir will be created with root privileges\\n", "")
+        return content
 
     def get_vnf_index(self, nsd_name, key):
         nsd = self.client.nsd.get(nsd_name)
@@ -811,6 +1337,8 @@ class OsmWrapper(object):
                 log_queue.put(["INFO", dumps(c, indent=4)])
             log_queue.put(["INFO", "In OSM Wrapper: CREATE_NS, config is"])
             log_queue.put(["INFO", dumps(config, indent=4)])
+            # log_queue.put(["INFO", "In OSM Wrapper: CREATE_NS, nsd_name: %s"%nsd_name])
+            # log_queue.put(["INFO", "In OSM Wrapper: CREATE_NS, distribution: %s"%distribution])
             self.client.ns.create2(nsd_name, ns_name, distribution=distribution, config=config, ssh_keys=ssh_keys)
             return self.client.ns.get(ns_name)['id']
         except ClientException as inst:
@@ -918,7 +1446,149 @@ class OsmWrapper(object):
 
             else:
                 return None
+    
+    def get_ip_mapping_of_deployed_service_osm(self, nsi_id):
+        ns_record = self.client.ns.get(nsi_id)
+        map_reference_ip = {}
+        instances_checked = {}
+        vnfs = ns_record["deploymentStatus"]["vnfs"]
+        #first see the amount of the same vnfs in a deployment
+        instances_vnfs = {}
+        for vnf in vnfs:
+            for vm in vnf["vms"]:
+                vnf_name = vm["name"]
+                if vnf_name not in instances_vnfs:
+                    instances_vnfs.update({vnf_name:1})
+                else:
+                    instances_vnfs[vnf_name] = instances_vnfs[vnf_name] + 1
 
+        for vnf in vnfs:
+            ip_address = vnf["ip_address"].split(";")
+            for vm in vnf["vms"]:
+                vnf_name = vm["name"]
+                if vnf_name not in instances_checked:
+                    instances_checked.update({vnf_name:1})
+                else:
+                    instances_checked[vnf_name] = instances_checked[vnf_name] + 1
+                # these three lines goes with the code commented below
+                # vnf_name_def = vnf_name
+                # if (instances_vnfs[vnf_name] > 1):
+                #     vnf_name_def = vnf_name + "_" + str(instances_checked[vnf_name]).zfill(2)
+                for iface in vm["interfaces"]:
+                    port_name = iface["external_name"]
+                    iface_address = iface["ip_address"]
+                    if (instances_checked[vnf_name] == 1):
+                        # this is the first instance
+                        keyA = "vnf." + vnf_name + ".vdu." + vnf_name + "_vdu.intcp." + port_name + ".address"
+                        keyB = "vnf." + vnf_name + ".vdu." + vnf_name + "_vdu.extcp." + port_name + ".floating"
+                        if (len(ip_address) == 2 and (iface_address == ip_address[0])):
+                            # we have the floating iface
+                            map_reference_ip.update({keyA:ip_address[1]})
+                            map_reference_ip.update({keyB:ip_address[0]})
+                        else:
+                            # it is a normal interface        
+                            map_reference_ip.update({keyA:iface_address})
+                    # other updates 
+                    instance_id = vnf_name + "-" + str(instances_checked[vnf_name])
+                    keyA = "vnf." + instance_id + ".vdu." + vnf_name + "_vdu.intcp." + port_name + ".address" 
+                    server_name = nsi_id + "-0-" + vnf_name + "-" + str(instances_checked[vnf_name]) 
+                    keyB = "vnf." + server_name + ".vdu." + vnf_name + "_vdu.extcp." + port_name + ".floating"
+                    if (len(ip_address) == 2 and (iface_address == ip_address[0])):
+                        # we have the floating iface
+                        map_reference_ip.update({keyA:ip_address[1]})
+                        map_reference_ip.update({keyB:ip_address[0]})
+                    else:
+                        # it is a normal interface        
+                        map_reference_ip.update({keyA:iface_address})
+
+# ORIGINAL code before changing to OSM format
+        # for vnf in vnfs:
+            # ip_address = vnf["ip_address"].split(";")
+            # for vm in vnf["vms"]:
+                # vnf_name = vm["name"]
+                # if vnf_name not in instances_checked:
+                    # instances_checked.update({vnf_name:1})
+                # else:
+                    # instances_checked[vnf_name] = instances_checked[vnf_name] + 1
+                # vnf_name_def = vnf_name
+                # if (instances_vnfs[vnf_name] > 1):
+                    # vnf_name_def = vnf_name + "_" + str(instances_checked[vnf_name]).zfill(2)
+                # for iface in vm["interfaces"]:
+                    # port_name = iface["external_name"]
+                    # iface_address = iface["ip_address"]
+                    # #keyA = "vnf." + vnf_name + ".vdu." + vnf_name + "_vdu.intcp." + port_name + ".address" + "." + str(instances[vnf_name])
+                    # #keyB = "vnf." + vnf_name + ".vdu." + vnf_name + "_vdu.extcp." + port_name + ".floating" + "." + str(instances[vnf_name])
+                    # keyA = "vnf." + vnf_name_def + ".vdu." + vnf_name_def + "_vdu.intcp." + port_name + ".address" 
+                    # keyB = "vnf." + vnf_name_def + ".vdu." + vnf_name_def + "_vdu.extcp." + port_name + ".floating"
+                    # if (len(ip_address) == 2 and (iface_address == ip_address[0])):
+                        # # we have the floating iface
+                        # map_reference_ip.update({keyA:ip_address[1]})
+                        # map_reference_ip.update({keyB:ip_address[0]})
+                    # else:
+                        # # it is a normal interface        
+                        # map_reference_ip.update({keyA:iface_address})
+        return map_reference_ip
+
+    def get_ip_mapping_of_deployed_service_scale (self, map_reference_ip, nsr_scale_info):
+        # this function updates the map reference ip after scaling
+        # we cannot rely on OSM because it does not provide info on the resulting VNF 
+        # scale operation, only that a scale operation has been done for this service instance
+        # to overcome this issue, we generate the update map_reference_ip with from the nsr_scale_info
+        # assumption: the instance "1" of a VNF cannot be never deleted, so the procedure will be 
+        # to regenerate the original map_reference_ip and then derive the new ones from the nsr_scale_info
+        log_queue.put(["INFO", "map_reference_ip: %s"%map_reference_ip])
+        log_queue.put(["INFO", "nsr_scale_info: %s"% nsr_scale_info])
+        # first we get the different vnfs in the service
+        constituent_vnf_names = []
+        for vnf in nsr_scale_info["vnfs"]:
+            if (vnf["name"] not in constituent_vnf_names):
+                constituent_vnf_names.append(vnf["name"])
+        new_map_reference_ip={}
+        # second we regenerate the original map_reference_ip which is inmutable over all operations
+        for key in map_reference_ip.keys():
+            key_values = key.split(".")
+            vnf_name = key_values[1]
+            if vnf_name in constituent_vnf_names:
+                # this is an entry belonging to instance 1 of a vnf 
+                new_map_reference_ip[key] = map_reference_ip[key]
+            vnf_name_bis = vnf_name.split("-")
+            if (vnf_name_bis[len(vnf_name_bis)-1] == "1"): 
+                # this is an entry belonging to instance 1 of a vnf
+                new_map_reference_ip[key] = map_reference_ip[key]
+        # we add the instances with an instance bigger than "1" that are present in the nsr_scale_info
+        for vnf in nsr_scale_info["vnfs"]:
+            if ((vnf["instance"]) != "1"):
+                # additional instance that is present due to scaling
+                for key in map_reference_ip.keys():
+                    key_values = key.split(".")
+                    if (key_values[1].find(vnf["name"] + "-" + "1") != -1):
+                        # this is an entry that we need to replicate but with a new value
+                        # case no floating
+                        if (key_values[len(key_values)-1] != "floating"):
+                            ip_to_check = map_reference_ip[key]
+                            for port in vnf["port_info"]:
+                                 #if port["ip_address"]
+                                mask = port["mask"]
+                                mask = mask[1:len(mask)]
+                                cidr = netaddr.IPNetwork(port["ip_address"]).supernet(int(mask))[0]
+                                if ((netaddr.IPAddress(map_reference_ip[key]) in cidr) and (netaddr.IPAddress(port["ip_address"]) in cidr)):
+                                    key_values_bis = key_values[1].split("-")
+                                    key_values_bis[len(key_values_bis)-1] = vnf["instance"]
+                                    key_values_bis = "-".join(key_values_bis)
+                                    key_values[1] = key_values_bis
+                                    key_values = ".".join(key_values)
+                                    new_map_reference_ip[key_values] = port["ip_address"]
+                        else: 
+                            # floating case
+                            # if the instance 1 has floating_ip, the other will have it too
+                            key_values_bis = key_values[1].split("-")
+                            key_values_bis[len(key_values_bis)-1] = vnf["instance"]
+                            key_values_bis = "-".join(key_values_bis)
+                            key_values[1] = key_values_bis
+                            key_values = ".".join(key_values)                       
+                            new_map_reference_ip[key_values] = vnf["floating_ips"][0][vnf["name"]]       
+        return new_map_reference_ip
+        
     def extract_target_il(self, body):
         if (body.scale_type == "SCALE_NS"):
             return body.scale_ns_data.scale_ns_to_level_data.ns_instantiation_level
@@ -964,6 +1634,11 @@ class OsmWrapper(object):
                     # scaling operation are done one by one
                     # protection for scale_in operation: the final number of VNFs cannot reach 0
                     if not (scale_info["scaleVnfType"] == "SCALE_IN" and (current_il_info[key] - ops < 1) ):
+                        #added due to rvm_agent
+                        if (scale_info["scaleVnfType"] == "SCALE_IN"):
+                            scale_info["instance"] = str(current_il_info[key] - ops)
+                        if (scale_info["scaleVnfType"] == "SCALE_OUT"):
+                            scale_info["instance"] = str(current_il_info[key]+1+ops)
                         scaling_il_info.append(scale_info)
         log_queue.put(["DEBUG", "Scale_il_info is: %s"%(scaling_il_info)])
         return scaling_il_info		
@@ -993,6 +1668,7 @@ class OsmWrapper(object):
         self.user = config_mano.get("OSM", "user")
         self.password = config_mano.get("OSM", "password")
         self.project = config_mano.get("OSM", "project")
+        self.rvm_agent = config_mano.get("OSM", "install_rvm_agent")
 
 
         if self.release == "3":
@@ -1030,7 +1706,7 @@ class OsmWrapper(object):
         -------
         To be defined
         """
-
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW starts instantiating" % (nsi_id)])
         instantiationLevel = body.ns_instantiation_level_id
         deploymentFlavour = body.flavour_id
         # for composition/federation
@@ -1044,39 +1720,71 @@ class OsmWrapper(object):
                 nsId_tmp = nsi_id + '_' + nested_descriptor
         else:
             nsId_tmp = nsi_id
-        log_queue.put(["INFO", "*****Time measure: OSMW start create networks OSM wrapper"])
+         
+        additional_params_for_vnf = []
+        if (self.rvm_agent == "yes" and mon_pushgateway == "yes"):
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW starts requesting creation of RVM_agents" % (nsId_tmp)])
+            # we request the creation of the rvm_agents 
+            additional_params_for_vnf = request_rvm_agents_scripts(self.client, \
+                                     ns_descriptor["nsd"]['nsdIdentifier']+ '_' + body.flavour_id + '_' \
+                                     + body.ns_instantiation_level_id, placement_info['usedNFVIPops'], nsId_tmp)
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW finished requesting creation of RVM_agents" % (nsId_tmp)])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW starts creating networks OSM wrapper" % (nsId_tmp)])
         config = deploy_vls_vim(nsi_id, ns_descriptor, vnfds_descriptor, instantiationLevel, deploymentFlavour, resources, placement_info, nestedInfo)
         nsir_db.save_vim_networks_info(nsId_tmp, config)
         # pass nsi_id as ns_name
         # for OSM R5, we have to indicate that we do not want to use wim at the client
         config['release'] = self.release
+        config['additionalParamsForVnf'] = self.adapt_paramsvnf_to_osm(additional_params_for_vnf)
         # in osm dbs, nsds will stored under the following convention: "nsdIdentifier_instantiationlevel"
-        log_queue.put(["INFO", "*****Time measure: OSMW finish create networks OSM wrapper"])
-        log_queue.put(["INFO", "*****Time measure: OSMW start instantiating VNFs at OSM wrapper"])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW finished create networks OSM wrapper" % (nsId_tmp)])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW start instantiating VNFs at OSM wrapper" % (nsId_tmp)])
         log_queue.put(["INFO", "In OSM Wrapper, instantiate_ns"])
         distrib = self.adapt_placement_to_osm(
-            placement_info['usedNFVIPops'], ns_descriptor["nsd"]['nsdIdentifier'] + '_' + body.flavour_id + '_' + body.ns_instantiation_level_id)
+            placement_info['usedNFVIPops'], ns_descriptor['nsd']['nsdIdentifier'] + '_' + body.flavour_id + '_' + body.ns_instantiation_level_id)
         r = self.create_ns(nsId_tmp, ns_descriptor['nsd']['nsdIdentifier'] + '_' + body.flavour_id + '_' +
                            body.ns_instantiation_level_id, config=config, distribution=distrib)
-
         if r is not None:
             number_vnfs = len(vnfds_descriptor)
             nsr = self.get_status_of_deployed_service(nsId_tmp, number_vnfs)
             if (nsr == "Failed"):
+                log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW failed instantiating VNFs at OSM wrapper" % (nsId_tmp)])
                 log_queue.put(["INFO", "In OSM Wrapper, the instantiation of the service failed"])
                 # but osm needs to be cleaned
                 # try:
-                #    self.client.ns.delete(nsId_tmp)
-                # except ClientException as inst:
-                #    log_queue.put(["INFO", "%s" % inst])
-                #    return None
-                # time.sleep(10*number_vnfs)
+                #   self.client.ns.delete(nsId_tmp)
+                #except ClientException as inst:
+                #   log_queue.put(["INFO", "%s" % inst])
+                #   return None
+                #time.sleep(10*number_vnfs)
+                #log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW cleaned VNFs at OSM wrapper" % (nsId_tmp)])
                 return None
             else:
                 nsr_info = get_information_of_deployed_service_os(nsId_tmp, placement_info["usedNFVIPops"], config['release'])
-                log_queue.put(["INFO", "In OSM Wrapper, instantiate_ns info is:"])
+                log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW created VNFs at OSM wrapper" % (nsId_tmp)])        
+                log_queue.put(["INFO", "In OSM Wrapper, BEFORE instantiate_ns info is:"])
                 log_queue.put(["INFO", dumps(nsr_info, indent=4)])
+                if (self.rvm_agent == "yes" and mon_pushgateway == "yes"):                
+                    # getting the mapping of IPs to ports and floating IP
+                    # adding the agent_id information to the nsr_info['vnfs'] field
+                    nsr_info['vnfs'] = add_rvm_agentid_info(nsr_info['vnfs'], additional_params_for_vnf)
+                    map_reference_ip = self.get_ip_mapping_of_deployed_service_osm(nsId_tmp)
+                    log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW saved map_reference_ip" % (nsId_tmp)])        
+                    nsir_db.save_map_reference_ip(nsId_tmp, map_reference_ip)
+                    log_queue.put(["INFO", "In OSM Wrapper, NS mapping is:"])
+                    log_queue.put(["INFO", dumps(map_reference_ip, indent=4)])                
+                    # executing scripts in the rvm_agents
+                    info_scripts = getting_nsd_scripts_for_vnfs( ns_descriptor["nsd"], body.flavour_id, body.ns_instantiation_level_id, map_reference_ip, nsr_info["vnfs"])
+                    log_queue.put(["INFO", "In OSM Wrapper, info scripts is: "])
+                    log_queue.put(["INFO", dumps(info_scripts, indent=4)])                                    
+                    execute_nsd_scripts('instantiate', info_scripts, nsr_info["vnfs"])
+                    log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW executed NSD scripts" % (nsId_tmp)])        
+                    log_queue.put(["INFO", "In OSM Wrapper, scripts are executed"])
+                # saving the info
+                log_queue.put(["INFO", "In OSM Wrapper, saving nsr_info is:"])
+                log_queue.put(["INFO", dumps(nsr_info['vnfs'], indent=4)])
                 nsir_db.save_vnf_deployed_info(nsId_tmp, nsr_info['vnfs'])
+                log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW saved nsr_info at DB"% (nsId_tmp)])        
                 nsr = extract_sap_info (config, nsr_info, ns_descriptor)
                 # log_queue.put(["DEBUG", "In OSM Wrapper, instantiate_ns return is NSR:"])
                 # log_queue.put(["DEBUG", dumps(nsr, indent=4)])
@@ -1085,7 +1793,7 @@ class OsmWrapper(object):
             return None
 
 
-    def scale_ns(self, nsi_id, ns_descriptor, vnfds_descriptor, body, current_df, current_il, placement_info):
+    def scale_ns(self, nsi_id, ns_descriptor, vnfds_descriptor, body, current_df, current_il, placement_info, nestedInfo=None):
         """
         Scales the network service identified by nsi_id, according to the infomation contained in the body and current instantiation level.
         Parameters
@@ -1106,33 +1814,88 @@ class OsmWrapper(object):
         -------
         To be defined
         """
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW starts scaling ops at OSM wrapper" % (nsi_id)])
         if (self.release =="3"):
             return "Scaling not possible with OSM Release 3"
+        # for scaling composition/federation
+        if nestedInfo:
+            nested_descriptor = next(iter(nestedInfo))
+            nsId_tmp = nsi_id + '_' + nested_descriptor
+        else:
+            nsId_tmp = nsi_id
+
         target_il = self.extract_target_il(body)
         scale_ops = self.extract_scaling_info(ns_descriptor, current_df, current_il, target_il)
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW extracted scaling ops" % (nsi_id)])
+        log_queue.put(["DEBUG", "In OSM Wrapper scale_ns, scale_ops are:"])
+        log_queue.put(["DEBUG", dumps(scale_ops, indent=4)])  
+        # TODO: check the following code in case of Composite NFV-NS scaling cases     
+        map_reference_ip = nsir_db.get_map_reference_ip(nsi_id)        
+        if (self.rvm_agent == "yes" and mon_pushgateway == "yes"):
+            # we execute stop scripts on those vnfs to SCALE_IN
+            vnf_info = nsir_db.get_vnf_deployed_info(nsi_id)
+            # map_reference_ip = nsir_db.get_map_reference_ip(nsi_id)
+            info_scripts = getting_nsd_scripts_for_vnfs_scale( ns_descriptor["nsd"], current_df, current_il, map_reference_ip, vnf_info, scale_ops, "SCALE_IN")
+            log_queue.put(["INFO", "In OSM Wrapper, info scripts for SCALE IN: "])
+            log_queue.put(["INFO", dumps(info_scripts, indent=4)]) 
+            if (len(info_scripts) > 0):            
+                execute_nsd_scripts('terminate', info_scripts, vnf_info)
+            # create the new rvm agents on the SCALE OUT operations
+            # we just create it but they are not needed to use it
+            # because when creating new VNFs, they will query the 
+            # initial script from the initial instance 
+            additional_params_for_vnf = request_rvm_agents_script_scale(nsi_id, scale_ops)
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW updated rvm_agents and scripts before scaling VNFs" % (nsi_id)])
+        # CLOSE TODO
         # refresh the token
         self.token = self.get_osm_token() # we initialize here the token, 
         # not in init because not all the operations need a token
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW starts scaling (out/in) VNFs at OSM wrapper" % (nsi_id)])  
+        index = 0        
         for vnf in scale_ops:
             # we perform scaling operations one by one
-            r= self.scale_ns_op (nsi_id, vnf['scaleVnfType'], vnf['vnfName'], vnf['vnfIndex'])
+            r= self.scale_ns_op (nsId_tmp, vnf['scaleVnfType'], vnf['vnfName'], vnf['vnfIndex'])
             if r is not None:
-               while ( self.get_service_status(nsi_id) == None):
+               while ( self.get_service_status(nsId_tmp) == None):
                    time.sleep(5)
             else:
                # there has been a failure and the scaling operation has not been processed
                return None
-        log_queue.put(["DEBUG", "scaled service: %s" % nsi_id])
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW scaled VNF index: %s" % (nsi_id, index)])  
+            index = index + 1
+        log_queue.put(["DEBUG", "scaled service: %s" % nsId_tmp])
         # nsr_scale_info = get_information_of_scaled_service_osm(nsi_id, placement_info, self.client)
-        nsr_scale_info = get_information_of_scaled_service_os(nsi_id, placement_info, self.client)
+        nsr_scale_info = get_information_of_scaled_service_os(nsId_tmp, placement_info, self.rvm_agent)
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW finished scaling VNFs at OSM wrapper" % (nsi_id)])
         # update nsir_db
-        nsir_db.save_vnf_deployed_info(nsi_id, nsr_scale_info['vnfs'])
-        config = nsir_db.get_vim_networks_info(nsi_id)
+        log_queue.put(["INFO", "In OSM Wrapper, saving nsr_info after scaling is:"])
+        log_queue.put(["INFO", dumps(nsr_scale_info['vnfs'], indent=4)])
+        nsir_db.save_vnf_deployed_info(nsId_tmp, nsr_scale_info['vnfs'])
+        # TODO: check the following code in case of Composite NFV-NS scaling cases     
+        if (self.rvm_agent == "yes" and mon_pushgateway == "yes"): 
+            # updating nsir_db with map_reference_ip       
+            # map_reference_ip = self.get_ip_mapping_of_deployed_service_osm(nsi_id)
+            map_reference_ip_after_scaling = self.get_ip_mapping_of_deployed_service_scale(map_reference_ip, nsr_scale_info)
+            nsir_db.save_map_reference_ip(nsi_id, map_reference_ip_after_scaling)
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW get map_reference ip" % (nsi_id)])
+            log_queue.put(["INFO", "In OSM Wrapper, SCALING NS mapping is:"])
+            log_queue.put(["INFO", dumps(map_reference_ip_after_scaling, indent=4)])
+            # # we need to execute the scripts on the new created VNFs
+            info_scripts = getting_nsd_scripts_for_vnfs_scale( ns_descriptor["nsd"], current_df, target_il, map_reference_ip_after_scaling, nsr_scale_info['vnfs'], scale_ops, "SCALE_OUT")
+            log_queue.put(["INFO", "In OSM Wrapper, SCALING OUT info scripts:"])
+            log_queue.put(["INFO", dumps(info_scripts, indent=4)])
+            if (len(info_scripts)> 0):
+                execute_nsd_scripts('instantiate', info_scripts, nsr_scale_info["vnfs"])             
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW updated rvm_agents and scripts after scaling VNFs" % nsi_id])      
+        # CLOSE TODO
+        config = nsir_db.get_vim_networks_info(nsId_tmp)
         # extract the sap
         nsr = extract_sap_info (config, nsr_scale_info, ns_descriptor)
         #remove vnfIdex from scale_ops, which is an OSM concept
         for elem in scale_ops:
             del elem['vnfIndex']
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW updated DBs" % nsi_id])           
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW finished scaling operation" % nsi_id])
         return [nsr, scale_ops]
 
     def terminate_ns(self, nsi_id):
@@ -1146,9 +1909,29 @@ class OsmWrapper(object):
         -------
         To be defined
         """
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW terminating service" % (nsi_id)])
         vnf_info = nsir_db.get_vnf_deployed_info(nsi_id)
+        if (self.rvm_agent == "yes" and mon_pushgateway == "yes"): 
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW stopping scripts at VNFs" % (nsi_id)])
+            # we terminate the scripts in the corresponding vnf's before terminating them
+            nsdId = ns_db.get_nsdId(nsi_id)
+            ns_descriptor = nsd_db.get_nsd_json(nsdId, None) 
+            current_il = ns_db.get_ns_il(nsi_id)
+            deployment_flavour = ns_db.get_ns_df(nsi_id)
+            map_reference_ip = nsir_db.get_map_reference_ip(nsi_id)
+            info_scripts = getting_nsd_scripts_for_vnfs( ns_descriptor["nsd"], deployment_flavour, current_il, map_reference_ip, vnf_info)
+            log_queue.put(["INFO", "In OSM Wrapper terminanting, info scripts is: "])
+            log_queue.put(["INFO", dumps(info_scripts, indent=4)])
+            execute_nsd_scripts('terminate', info_scripts, vnf_info)
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW stopped scripts at VNFs" % (nsi_id)])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW start deleting rvm_agents at the monitoring platform" % (nsi_id)])
+        for vnf in vnf_info:
+            if "agent_id" in vnf.keys():
+                delete_rvm_agent(vnf["agent_id"])
+                log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW deleted rvm_agent: %s"% (nsi_id,vnf["agent_id"])])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW deleted rvm_agents at the monitoring platform" %(nsi_id)])
         number_vnfs = len(vnf_info)
-        log_queue.put(["INFO", "*****Time measure: OSMW starting deleting VNFs at OSM for service: %s" %nsi_id])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW starting deleting VNFs at OSM" %nsi_id])
         log_queue.put(["INFO", "In OSM Wrapper TERMINATE, number_vnfs: %s"%number_vnfs])
         try:
             self.client.ns.delete(nsi_id)
@@ -1161,12 +1944,14 @@ class OsmWrapper(object):
             # remove the created networks at the different vims
         # sleep to make sure all ports have been deleted by osm
         time.sleep(10*number_vnfs)
-        log_queue.put(["INFO", "*****Time measure: OSMW deleted VNFs at OSM"])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW deleted VNFs at OSM" % (nsi_id)])
         vim_networks = nsir_db.get_vim_networks_info(nsi_id)
         log_queue.put(["INFO", "In OSM Wrapper TERMINATE, vim networks is:"])
         log_queue.put(["INFO", dumps(vim_networks, indent=4)])
         delete_networks(vim_networks)
-        log_queue.put(["INFO", "*****Time measure: OSMW deleted networks OSM"])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW deleted networks OSM" % (nsi_id)])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: OSMW OSMW terminated service" % (nsi_id)])
+
 
     def onboard_nsd(self, nsd_json):
         """

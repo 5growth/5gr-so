@@ -29,6 +29,7 @@ from db.ns_db.ns_db import empty_ns_collection
 from db.operation_db.operation_db import empty_operation_collection
 from db.resources_db.resources_db import empty_resources_collection
 from db.nsir_db.nsir_db import empty_nsir_collection
+from db.notification_db.notification_db import empty_notification_collection
 from coreMano.osm_db.osm_db import empty_osm_collection
 
 
@@ -41,6 +42,7 @@ def main():
     empty_operation_collection()
     empty_resources_collection()
     empty_nsir_collection()
+    empty_notification_collection()
     empty_osm_collection()
 
     # path to descriptors folders

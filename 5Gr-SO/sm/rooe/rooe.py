@@ -468,9 +468,17 @@ def extract_vls_info_mtp(resources, extracted_info, placement_info, nsId, nested
 
     ll_processed = {}
 
-    src_dst_link_triplet = []
+    src_dst_link_triplet = [] 
+    # check if mappedVNFpairs info in "usedLLs" (new field of PA response)
+    # assuming that it is in the first one, it is in all
+    VNFpairs = False
+    if ((len(placement_info["usedLLs"]) > 0) and ("mappedVNFpairs" in placement_info["usedLLs"][0].keys())):
+         VNFpairs = True 
+    log_queue.put(["INFO", "The value of VNFpairs: %s"%VNFpairs])         
     for ll in placement_info["usedLLs"]:
         llId = ll["LLID"]
+        log_queue.put(["INFO", "Processing LLID: %s"%llId])
+        ll_index = 0
         for vl in ll["mappedVLs"]:  # vl is the VL Id
             if not vl in ll_processed:
                 ll_processed[vl] = 1
@@ -487,8 +495,15 @@ def extract_vls_info_mtp(resources, extracted_info, placement_info, nsId, nested
                         "reqLatency": 0,
                         "metaData": []
                        }
-            metadata, src_dst_link_triplet =  getVnfIPs(vl, extracted_info["nsd"]["VNFLinks"], vnf_info, network_info, \
-                                              ll_processed[vl], placement_info, llId, resources, src_dst_link_triplet, nestedInfo)
+            if (VNFpairs):
+                log_queue.put(["INFO", "Using NEW method to getVnfIPs to obtain LL metadata"])
+                mappedVNFpair = ll["mappedVNFpairs"][ll_index]   
+                metadata = getVnfIPs_v2(vl, mappedVNFpair, vnf_info, network_info, llId, resources, nestedInfo) 
+            else:            
+                log_queue.put(["INFO", "Using former method to getVnfIPs to obtain LL metadata"])
+                metadata, src_dst_link_triplet =  getVnfIPs(vl, extracted_info["nsd"]["VNFLinks"], vnf_info, network_info, \
+                                                  ll_processed[vl], placement_info, llId, resources, src_dst_link_triplet, nestedInfo)
+            
             ll_info["metaData"] = metadata
             # ll_info["reqBandwidth"] = ll_resources[llId]["capacity"]
             # ll_info["reqLatency"] = ll_resources[llId]["latency"]
@@ -500,6 +515,7 @@ def extract_vls_info_mtp(resources, extracted_info, placement_info, nsId, nested
             ll_info["logicalLinkAttributes"]["localLinkId"] = ll_resources[llId]["localLinkId"]
             ll_info["logicalLinkAttributes"]["logicalLinkId"] = llId
             vls_info["logicalLinkPathList"].append(ll_info)
+            ll_index = ll_index + 1
 
     log_queue.put(["INFO", "VLS_info for eenet is:"])
     log_queue.put(["INFO", dumps(vls_info, indent=4)])
@@ -544,7 +560,7 @@ def getVnfIPs(vlId, VNFLinks, vnf_info, network_info, index, placement_info, llI
                                         vl = virtual_link[key]                   
                         if (net.find(vl) !=-1):
                             cidr = network_info["cidr"][net]
-                            log_queue.put(["INFO", "el cidr es: %s"%cidr])
+                            # log_queue.put(["INFO", "el cidr es: %s"%cidr])
                             network_name = net
                     for vnf in vnf_info:
                         if (vnf["name"] == src_vnf):
@@ -573,6 +589,98 @@ def getVnfIPs(vlId, VNFLinks, vnf_info, network_info, index, placement_info, llI
                     return [ [{"key": "srcVnfIpAddress", "value": srcVnfIpAddress}, {"key": "dstVnfIpAddress", "value": dstVnfIpAddress}, 
                               {"key": "srcVnfMacAddress", "value": srcVnfMacAddress }, {"key": "dstVnfMacAddress", "value": dstVnfMacAddress}, 
                               {"key": "networkName", "value": network_name}], src_dst_link_triplet ]
+
+def getVnfIPs_v2(vlId, mappedVNFpair, vnf_info, network_info, llId, resources, nestedInfo=None):
+    """
+    This function prepares the required metadata info to allocate resources for a VL in a LL 
+    This function is based on the new definition of the PA API response
+    Parameters
+    ----------
+    vlId: string
+        Name of the VL connecting two VNFs through a LL
+    mappedVNFpair:  pair
+        Pair of strings with the name of the VNFs connected by the VL through the LL
+    vnf_info: dict
+        Instantiation information details about VNFs
+    network_info: dict
+        Instantiation information details about created networks for VLs
+    llId: string
+        Name of the LL used to implement the VL
+    resources: dict 
+        Resource information description from the MTP
+    nestedInfo: dict
+        Contains information about possible network name in case of composition/federation
+    Returns
+    -------
+    scaling_info: list of dictionaries
+        List with the dictionary of the operations to be done, either scale out or scale in
+    """
+    # This function prepares the metadata for a LL based on the new definition of the response of the PA
+    # {'mappedVLs': ['mgt_vepc_vl'], 'LLID': '120000_f', 'mappedVNFpairs': [{'VNFt': 'SERVER_VNF', 'VNFh': 'SECGW_VNF'}]}]}
+    src_vnf = mappedVNFpair["VNFh"]
+    dst_vnf = mappedVNFpair["VNFt"]
+    vl = vlId
+    orderedpops = checkSenseLL(llId, resources)
+    # there is no need to check if VNFs are in different Pops or whether the 
+    # Pops are connected by the llid
+    for net in network_info["cidr"]:
+        # for composition/federation when having a nested in multi-pop 
+        # and you are instantiating everything from scratch
+        if nestedInfo:
+        # look for the appropriate link and change the vl value
+            nested_id = next(iter(nestedInfo))
+            for virtual_link in nestedInfo[nested_id][0]:
+                for key in virtual_link.keys():
+                    if (key == vl):
+                        vl = virtual_link[key]                   
+        if (net.find(vl) !=-1):
+            cidr = network_info["cidr"][net]
+            network_name = net
+    src_check = False
+    dst_check = False
+    for vnf in vnf_info:
+        #solving the issue with multiple instances of a same VNF in an NS
+        log_queue.put(["INFO", "Checking vnf: %s"%vnf["name"]])
+        log_queue.put(["INFO", "Processing 6-values: [src_vnf, dst_vnf, vl, llId, src_pop, dst_pop]"])
+        log_queue.put(["INFO", "[%s,%s,%s,%s,%s,%s]"%(src_vnf, dst_vnf, vl, llId, orderedpops[0], orderedpops[1])])
+        if (vnf["name"] == src_vnf and (vnf["dc"] == orderedpops[0]) ):
+            src_pop = orderedpops[0]
+            for port in vnf["port_info"]: 
+                log_queue.put(["INFO", "Checking SRC %s port: %s"%(src_vnf, port["ip_address"])])
+                if netaddr.IPAddress(port["ip_address"]) in netaddr.IPNetwork(cidr):
+                    srcVnfIpAddress_tmp = port["ip_address"]
+                    srcVnfMacAddress_tmp = port["mac_address"]
+                    src_check = True
+                    break
+
+        if (vnf["name"] == dst_vnf and (vnf["dc"] == orderedpops[1]) ):
+            dst_pop = orderedpops[1]    
+            for port in vnf["port_info"]: 
+                log_queue.put(["INFO", "Checking DST %s port: %s"%(dst_vnf, port["ip_address"])])
+                if netaddr.IPAddress(port["ip_address"]) in netaddr.IPNetwork(cidr):
+                    dstVnfIpAddress_tmp = port["ip_address"]
+                    dstVnfMacAddress_tmp = port["mac_address"]
+                    dst_check = True
+                    break
+        if (src_check and dst_check):
+            break
+            
+    # now we have to take into account the sense of the of the link
+    # orderedpops = checkSenseLL(llId, resources)
+    if (orderedpops[0] == src_pop and orderedpops[1] == dst_pop):
+        srcVnfIpAddress = srcVnfIpAddress_tmp
+        srcVnfMacAddress = srcVnfMacAddress_tmp
+        dstVnfIpAddress = dstVnfIpAddress_tmp
+        dstVnfMacAddress = dstVnfMacAddress_tmp
+    else:
+        srcVnfIpAddress = dstVnfIpAddress_tmp
+        srcVnfMacAddress = dstVnfMacAddress_tmp
+        dstVnfIpAddress = srcVnfIpAddress_tmp
+        dstVnfMacAddress = srcVnfMacAddress_tmp
+    return [ {"key": "srcVnfIpAddress", "value": srcVnfIpAddress}, {"key": "dstVnfIpAddress", "value": dstVnfIpAddress}, 
+             {"key": "srcVnfMacAddress", "value": srcVnfMacAddress }, {"key": "dstVnfMacAddress", "value": dstVnfMacAddress}, 
+             {"key": "networkName", "value": network_name} ] 
+
 
 def checkSenseLL(llId, resources):
     #function to verify the sense of the llId
@@ -608,6 +716,158 @@ def extract_target_il(request):
     if (request.scale_type == "SCALE_NS"):
         return request.scale_ns_data.scale_ns_to_level_data.ns_instantiation_level        
 
+def extract_scaling_info(ns_descriptor, current_df, current_il, target_il):
+    """
+    This function extracts the required operations to pass from current_il to target_il in a scale operation
+    Parameters
+    ----------
+    ns_descriptor: json
+        NS descriptor in json format
+    current_df: string
+        Current deployment flavour
+    current_il: string
+        Current instantiation level
+    target_il: string
+        Target instantiation level within the current deployment flavour
+    Returns
+    -------
+    scaling_info: list of dictionaries
+        List with the dictionary of the operations to be done, either scale out or scale in
+    """
+
+    # we extract the required scaling operations comparing target_il with current_il
+    # assumption 1: we assume that there will not be new VNFs, so all the keys of target and current are the same
+    # scale_info: list of dicts {'vnfName': 'spr21', 'scaleVnfType': 'SCALE_OUT'}
+    target_il_info = {}
+    current_il_info = {}
+    for df in ns_descriptor["nsd"]["nsDf"]:
+        if (df["nsDfId"] == current_df):
+            for il in df["nsInstantiationLevel"]:
+                if (il["nsLevelId"] == target_il):
+                    for vnf in il["vnfToLevelMapping"]:
+                        for profile in df["vnfProfile"]:
+                            if (vnf["vnfProfileId"] == profile["vnfProfileId"]):
+                                target_il_info[profile["vnfdId"]] = int(vnf["numberOfInstances"])
+                if (il["nsLevelId"] == current_il):
+                    for vnf in il["vnfToLevelMapping"]:
+                        for profile in df["vnfProfile"]:
+                            if (vnf["vnfProfileId"] == profile["vnfProfileId"]):
+                                current_il_info[profile["vnfdId"]] = int(vnf["numberOfInstances"])
+    log_queue.put(["DEBUG", "ROOE Target il %s info: %s"% (target_il, target_il_info)])
+    log_queue.put(["DEBUG", "ROOE Current il %s info: %s"% (current_il, current_il_info)])
+    scaling_il_info = []
+    for key in target_il_info.keys():
+        scaling_sign = target_il_info[key] - current_il_info[key]
+        if (scaling_sign !=0):
+            scale_info ={}
+            scale_info["vnfName"] = key 
+            if (scaling_sign > 0): #SCALE_OUT
+                scale_info["scaleVnfType"] = "SCALE_OUT"
+            elif (scaling_sign < 0): #SCALE_IN
+                scale_info["scaleVnfType"] = "SCALE_IN"          
+            for ops in range (0, abs(scaling_sign)):
+                # scale_info["instanceNumber"] = str(current_il_info[key] + ops + 1) -> not needed instance number
+                # scaling operation are done one by one
+                # protection for scale_in operation: the final number of VNFs cannot reach 0
+                if not (scale_info["scaleVnfType"] == "SCALE_IN" and (current_il_info[key] - ops < 1) ):
+                    scaling_il_info.append(scale_info)
+    scaling_il_info_sorted = sorted(scaling_il_info, key = lambda i: i['scaleVnfType'])
+    log_queue.put(["DEBUG", "ROOE Scale_il_info is: %s"%(scaling_il_info_sorted)])
+    return scaling_il_info_sorted
+
+def get_infra_pop_resources(resources):
+    """
+    This function extracts the remaining resources in the PoPs from the information provided by the MTP/RL
+    Parameters
+    ----------
+    Returns
+    -------
+    PoP_resources: dict of dictionaries
+        For each PoP reported by the MTP/RL, this function return the available cpu, ram and storage
+    """
+    ## missing checking network resources!
+    PoP_resources = {}
+    for PoP in resources["NfviPops"]:
+        PoP_res = {}
+        if PoP["nfviPopAttributes"]["nfviPopId"] not in PoP_res:
+            PoP_res[PoP["nfviPopAttributes"]["nfviPopId"]]={}
+        # print(PoP["nfviPopAttributes"]["nfviPopId"])
+        # print(PoP["nfviPopAttributes"]["resourceZoneAttributes"]["cpuResourceAttributes"]["availableCapacity"])
+        # print ("memo")
+        PoP_res[PoP["nfviPopAttributes"]["nfviPopId"]] = { "availableCpu": int(PoP["nfviPopAttributes"]["resourceZoneAttributes"][0]["cpuResourceAttributes"]["availableCapacity"]) ,
+                                    "availableMemory": int(PoP["nfviPopAttributes"]["resourceZoneAttributes"][0]["memoryResourceAttributes"]["availableCapacity"]) ,
+                                    "availableStorage": int(PoP["nfviPopAttributes"]["resourceZoneAttributes"][0]["storageResourceAttributes"]["availableCapacity"])}
+                              
+        PoP_resources.update(PoP_res)
+    return PoP_resources
+
+def checking_remaining_PoP_resources_after_scaling (PoP_res_dict, scaling_info, placement_info, nsd_json, vnfds_json, current_df, current_il):
+    """
+    This function correlates the information of extracts the remaining resources in the PoPs from the information provided by the MTP/RL
+    Parameters
+    ----------
+    PoP_res_dict: dict of dict
+        Dict of dicts containing the available cpu, ram, storage of the PoPs reported by the MTP/RL
+    Scaling_info: list of dict
+        List containing the actions that have to be done to pass from the current_il to the target_il
+    Placement_info: dict
+        Dictionary containing the PoPs/LLs to deploy an NS -> result of the PA
+    nsd_json: json
+        Network service descriptor
+    vnfds_json: dict
+        Dictionary with the jsons of the VNFs, the key is the VNFId
+    current_df: string
+        Current deployment flavour
+    current_il: string
+        Current instantiation level
+    Returns
+    -------
+    PoP_remaining_res: list of dictionaries
+        For each PoP reported by the MTP/RL, this function return the remaining available cpu, ram and storage
+        If any of these parameters as a consequence of an scaling action goes below 0, PoP_remaining_res is set to None
+        to indicate ROE that cannot proceed with the scaling operation        
+    """
+    class my_request:
+        flavour_id = current_df
+        ns_instantiation_level_id = current_il
+        # for the moment we keep it to void, in future, maybe is needed to save all instantiation request
+        sap_data = []
+    request = my_request()
+    PoP_remaining_res = PoP_res_dict
+    extracted_info = extract_nsd_info_for_pa(nsd_json, vnfds_json, request)  
+    for action in scaling_info:
+        vnfdId = action["vnfName"]
+        for vnf in extracted_info["nsd"]["VNFs"]:
+            if vnf["VNFid"] == vnfdId:
+                resources_vnf = {}
+                resources_vnf["cpu"] = vnf["requirements"]["cpu"]
+                resources_vnf["ram"] = vnf["requirements"]["ram"]               
+                resources_vnf["storage"] = vnf["requirements"]["storage"]
+                # WARNING: there could be an issue if in an NSD instantiate several times the same VNF (duringn instantation)
+                # if you instantiate and these equal VNFs are in different pop, when doing the scaling you do not have certainty in which pop
+                # is the VNF you are going to scale -> according to the code logic, the first found VNF coinciding will be the one scaling
+                pop_vnf = None
+                for pops in placement_info["usedNFVIPops"]:
+                    if vnfdId in pops["mappedVNFs"]:
+                        pop_vnf = pops["NFVIPoPID"]
+                        break
+                if (pop_vnf):
+                    if action["scaleVnfType"] == "SCALE_IN":
+                        PoP_remaining_res[pop_vnf]["availableCpu"] = PoP_remaining_res[pop_vnf]["availableCpu"] + resources_vnf["cpu"]
+                        PoP_remaining_res[pop_vnf]["availableMemory"] = PoP_remaining_res[pop_vnf]["availableMemory"] + (resources_vnf["ram"]*1024)
+                        PoP_remaining_res[pop_vnf]["availableStorage"] = PoP_remaining_res[pop_vnf]["availableStorage"] + resources_vnf["storage"]
+                    if action["scaleVnfType"] == "SCALE_OUT":
+                        PoP_remaining_res[pop_vnf]["availableCpu"] = PoP_remaining_res[pop_vnf]["availableCpu"] - resources_vnf["cpu"]
+                        if (PoP_remaining_res[pop_vnf]["availableCpu"] < 0):
+                            return None
+                        PoP_remaining_res[pop_vnf]["availableMemory"] = PoP_remaining_res[pop_vnf]["availableMemory"] - (resources_vnf["ram"]*1024)
+                        if (PoP_remaining_res[pop_vnf]["availableMemory"] < 0):
+                            return None
+                        PoP_remaining_res[pop_vnf]["availableStorage"] = PoP_remaining_res[pop_vnf]["availableStorage"] - resources_vnf["storage"]
+                        if (PoP_remaining_res[pop_vnf]["availableCpu"] < 0):
+                            return None
+    return PoP_remaining_res
+
 def update_vls_info_mtp(nsId, scale_ops):
     """
     This function updates (create/destroy) the virtual links according to the scaling operations
@@ -632,11 +892,26 @@ def update_vls_info_mtp(nsId, scale_ops):
                 "metaData": []
                }
     vls_to_remove = []
+    # To support scaling Composite NFV-NS scaling cases 
+    # First, we need to filter those VLs corresponding to federated connections
+    #they are the ones whose CIDR is not within the vnf_info. Ej (4thoctet of IPaddress / 12)
+    resources = sbi.get_mtp_resources()
+    ll_links_bis = []
+    gw_local_pops = []
+    for PoP in resources["NfviPops"]:
+        for gw in PoP["nfviPopAttributes"]["networkConnectivityEndpoint"]:
+            gw_local_pops.append(gw["netGwIpAddress"])
+    for link in ll_links:
+        for i in link:
+            #print (link[i]["logicalLinkAttributes"])
+            attributes = link[i]["logicalLinkAttributes"]
+            if (attributes["dstGwIpAddress"] in gw_local_pops and attributes["srcGwIpAddress"] in gw_local_pops):
+                ll_links_bis.append(link)
     # the idea is to add or remove based on the scaleVnfType action of scale_op
     # scale_ops = [{'scaleVnfType': 'SCALE_OUT', 'vnfIndex': '3', 'vnfName': 'spr21'}]
     # first we treat scale_in operations
     # if it is scale_in, we have to detect in the ll_links that either the src or the dst address is not in the ll_link list
-    for link in ll_links:
+    for link in ll_links_bis:
         for i in link:
             value = link[i]
             ips = []
@@ -668,7 +943,7 @@ def update_vls_info_mtp(nsId, scale_ops):
                     vnfs_mac[port['ip_address']] = port['mac_address']
         # now we have a vector with the ips of all ports of all vnfs with
         # a name correspoding to a SCALE_OUT operation
-        for link in ll_links:
+        for link in ll_links_bis:
             for i in link:
                 value = link[i]
                 for elem in value["metaData"]:
@@ -746,15 +1021,15 @@ def instantiate_ns(nsId, nsd_json, vnfds_json, request, nestedInfo=None):
         return description
     """
     # extract the relevant information for the PA algorithm from the nsd_vnfd
-    log_queue.put(["INFO", "*****Time measure: ROE starting ROE processing"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE starting instantiating ROE processing" % (nsId)])
     extracted_info = extract_nsd_info_for_pa(nsd_json, vnfds_json, request)
-    log_queue.put(["INFO", "*****Time measure: ROE extracted NSD info at ROE"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE extracted NSD info at ROE" % (nsId)])
     log_queue.put(["INFO", dumps(extracted_info, indent=4)])
     # first get mtp resources and lock db
     resources = sbi.get_mtp_resources()
     log_queue.put(["INFO", "MTP resources are:"])
     log_queue.put(["INFO", dumps(resources, indent=4)])
-    log_queue.put(["INFO", "*****Time measure: ROE retrieved MTP resources"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE retrieved MTP resources" % (nsId)])
     
     # ask pa to calculate the placement - read pa config from properties file
     config = RawConfigParser()
@@ -764,7 +1039,7 @@ def instantiate_ns(nsId, nsd_json, vnfds_json, request, nestedInfo=None):
     pa_path = config.get("PA", "pa.path")
     pa_enable = config.get("PA", "pa.enable")
     placement_info = {}
-    if pa_enable == "yes":
+    if pa_enable == "true":
         pa_uri = "http://" + pa_ip + ":" + pa_port + pa_path
         # ask pa to calculate the placement - prepare the body
         paId = str(uuid4())
@@ -778,7 +1053,7 @@ def instantiate_ns(nsId, nsd_json, vnfds_json, request, nestedInfo=None):
         # ask pa to calculate the placement - do request
         header = {'Content-Type': 'application/json',
                   'Accept': 'application/json'}
-        log_queue.put(["INFO", "*****Time measure: ROE PA request generated"])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE PA request generated" % (nsId)])
         try:
             conn = HTTPConnection(pa_ip, pa_port)
             conn.request("POST", pa_uri, dumps(body_pa), header)
@@ -793,7 +1068,7 @@ def instantiate_ns(nsId, nsd_json, vnfds_json, request, nestedInfo=None):
         log_queue.put(["INFO", "output of the PA is: "])
         log_queue.put(["INFO", placement_info])
         placement_info = amending_pa_output(extracted_info["nsd"], placement_info)
-        log_queue.put(["INFO", "*****Time measure: ROE PA calculation done"])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE PA calculation done" % (nsId)])
         log_queue.put(["INFO", "PA tuned output is:"])
         log_queue.put(["INFO", placement_info])
     else:
@@ -804,7 +1079,8 @@ def instantiate_ns(nsId, nsd_json, vnfds_json, request, nestedInfo=None):
                 placement_info = json.loads(pa_response[1])
         log_queue.put(["INFO", "PA TUNED (manually) output is:"])
         log_queue.put(["DEBUG", placement_info])
-
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE STATIC PA" % (nsId)])
+  
     log_queue.put(["DEBUG", "Service NameId is: %s" % nsd_json["nsd"]["nsdIdentifier"]])
     if nestedInfo:
         key = next(iter(nestedInfo))
@@ -822,20 +1098,21 @@ def instantiate_ns(nsId, nsd_json, vnfds_json, request, nestedInfo=None):
     # ask cloudify/OSM to deploy vnfs
     coreMano = createWrapper()
     deployed_vnfs_info = {}
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE saved placement_info" % (nsId_tmp)])
     deployed_vnfs_info = coreMano.instantiate_ns(nsId, nsd_json, vnfds_json, request, placement_info, resources, nestedInfo)
     log_queue.put(["INFO", "The deployed_vnfs_info"])
     log_queue.put(["INFO", dumps(deployed_vnfs_info, indent=4)])
     if (deployed_vnfs_info is not None) and ("sapInfo" in deployed_vnfs_info):
-        log_queue.put(["INFO", "ROOE: updating nsi:%s sapInfo: %s" % (nsId, deployed_vnfs_info["sapInfo"])])
+        log_queue.put(["INFO", "ROOE: updating nsi:%s sapInfo: %s" % (nsId_tmp, deployed_vnfs_info["sapInfo"])])
         ns_db.save_sap_info(nsId, deployed_vnfs_info["sapInfo"])
-        log_queue.put(["INFO", "*****Time measure: ROE created VNF's"])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE-OSMW created VNF's" % (nsId_tmp)])
     if deployed_vnfs_info is not None:
       # list of VLs to be deployed
       vls_info = extract_vls_info_mtp(resources, extracted_info, placement_info, nsId_tmp, nestedInfo)
-      log_queue.put(["INFO", "*****Time measure: ROE extracted VL's at MTP"])
+      log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE extracted VL's at MTP" % (nsId_tmp)])
       # ask network execution engine to deploy the virtual links
       eenet.deploy_vls(vls_info, nsId_tmp)
-    log_queue.put(["INFO", "*****Time measure: ROE created LL's at MTP"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE created LL's at MTP" % (nsId_tmp)])
 
     # set operation status as SUCCESSFULLY_DONE
     if (nsId_tmp.find('_') == -1):
@@ -851,41 +1128,83 @@ def instantiate_ns(nsId, nsd_json, vnfds_json, request, nestedInfo=None):
             operation_db.set_operation_status(operationId, "FAILED")
             # set ns status as FAILED
             ns_db.set_ns_status(nsId, "FAILED")
-
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE finished instantiating ROE processing" % (nsId_tmp)])
     log_queue.put(["INFO", "INSTANTIATION FINISHED :)"])
 
 
-def scale_ns(nsId, nsd_json, vnfds_json, request, current_df, current_il):
+def scale_ns(nsId, nsd_json, vnfds_json, request, current_df, current_il, nestedInfo=None):
     # all intelligence delegated to wrapper
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE starting scale_ns ROE processing" % nsId])
     coreMano = createWrapper()
     scaled_vnfs_info = {}
-    placement_info = nsir_db.get_placement_info(nsId)
-    [scaled_vnfs_info, scale_ops] = coreMano.scale_ns(nsId, nsd_json, vnfds_json, request, current_df, current_il, placement_info)
-    if (scaled_vnfs_info is not None) and ("sapInfo" in scaled_vnfs_info):
-        log_queue.put(["DEBUG", "ROOE: SCALING updating nsi:%s sapInfo %s" % (nsId, scaled_vnfs_info["sapInfo"])])
-        ns_db.save_sap_info(nsId, scaled_vnfs_info["sapInfo"])
-    # update list of VLs to be deployed
-    [vls_info, vls_to_remove] = update_vls_info_mtp(nsId, scale_ops)
-    
-    # ask network execution engine to update the virtual links
-    eenet.update_vls(nsId, vls_info, vls_to_remove)
-
-    # set operation status as SUCCESSFULLY_DONE
-    operationId = operation_db.get_operationId(nsId, "INSTANTIATION")
-    if scaled_vnfs_info is not None:
-        log_queue.put(["DEBUG", "NS Scaling finished correctly"])
-        operation_db.set_operation_status(operationId, "SUCCESSFULLY_DONE")
-        # update the IL in the database after finishing correctly the operations
-        target_il = extract_target_il(request)
-        ns_db.set_ns_il(nsId, target_il)
-        # set ns status as INSTANTIATED
-        ns_db.set_ns_status(nsId, "INSTANTIATED")
+    if nestedInfo:
+        key = next(iter(nestedInfo))
+        log_queue.put(["DEBUG", "the key of nestedInfo in SCALING ROOE is: %s"%key])
+        nsId_tmp = nsId + '_' + next(iter(nestedInfo))
+        # check the case with the instantiation_ns method in case, the call comes from a consumer domain
+        # in the case of the call coming from a consumer domain, I do not see 
     else:
+        nsId_tmp = nsId
+    placement_info = nsir_db.get_placement_info(nsId_tmp)
+    # adding the checking to see if there are enough resources to process scaling
+    target_il = extract_target_il(request)
+    scaling_info = extract_scaling_info(nsd_json, current_df, current_il, target_il)
+    # getting resources from the RL to check availability
+    resources = sbi.get_mtp_resources()
+    PoP_resources = get_infra_pop_resources(resources)
+    log_queue.put(["DEBUG", "ROOE: SCALING PoP resources before: "])
+    log_queue.put(["DEBUG", dumps(PoP_resources, indent=4)])
+    PoP_remaining_res = checking_remaining_PoP_resources_after_scaling (PoP_resources, scaling_info, \
+                        placement_info, nsd_json, vnfds_json, current_df, current_il)
+    log_queue.put(["DEBUG", "ROOE: SCALING PoP resources after: "])
+    log_queue.put(["DEBUG", dumps(PoP_remaining_res, indent=4)])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE verified enough VIM resources for scale operation" % nsId])
+    ###
+    if (PoP_remaining_res):
+        [scaled_vnfs_info, scale_ops] = coreMano.scale_ns(nsId, nsd_json, vnfds_json, request, current_df, current_il, placement_info, nestedInfo)
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE scaled created VNF's, current_df: %s, current_il: %s"%(nsId, current_df, current_il)])
+        if (scaled_vnfs_info is not None) and ("sapInfo" in scaled_vnfs_info):
+            log_queue.put(["DEBUG", "ROOE: SCALING updating nsi:%s sapInfo %s" % (nsId, scaled_vnfs_info["sapInfo"])])
+            ns_db.save_sap_info(nsId, scaled_vnfs_info["sapInfo"])
+        # update list of VLs to be deployed
+        [vls_info, vls_to_remove] = update_vls_info_mtp(nsId_tmp, scale_ops)
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE scale-extracted VL's at RL" % (nsId_tmp)])
+
+        # ask network execution engine to update the virtual links
+        eenet.update_vls(nsId_tmp, vls_info, vls_to_remove)
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE scale LL's at MTP" % (nsId)])
+
+        # set operation status as SUCCESSFULLY_DONE
+        if (nsId_tmp.find('_') == -1):
+            # the service is single, I can update the operationId, and the status
+            # if not, we do it from the SOEp
+            operationId = operation_db.get_operationIdcomplete(nsId, "INSTANTIATION", "PROCESSING")
+            # operationId = operation_db.get_operationId(nsId, "INSTANTIATION")
+            if scaled_vnfs_info is not None:
+                log_queue.put(["DEBUG", "NS Scaling finished correctly"])
+                if not ns_db.get_ns_shared_services_ids(nsId_tmp):
+                   # it means that there are not associated further actions, otherwise, the
+                   # operation is updated at the SOEp level 
+                   # log_queue.put(["DEBUG", "I am going to change to success the OperationId: %s"%operationId])
+                   operation_db.set_operation_status(operationId, "SUCCESSFULLY_DONE")
+                # update the IL in the database after finishing correctly the operations
+                target_il = extract_target_il(request)
+                ns_db.set_ns_il(nsId, target_il)
+                # set ns status as INSTANTIATED
+                ns_db.set_ns_status(nsId, "INSTANTIATED")
+            else:
+                log_queue.put(["ERROR", "NS Scaling FAILED"])
+                operation_db.set_operation_status(operationId, "FAILED")
+                # set ns status as FAILED
+                ns_db.set_ns_status(nsId, "FAILED")
+    else: 
+        # there are not enough resources in the PoP to perform scaling operation
+        operationId = operation_db.get_operationId(nsId, "INSTANTIATION")
         log_queue.put(["ERROR", "NS Scaling FAILED"])
         operation_db.set_operation_status(operationId, "FAILED")
         # set ns status as FAILED
-        ns_db.set_ns_status(nsId, "FAILED")
-
+        ns_db.set_ns_status(nsId, "INSTANTIATED")
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE finished scale_ns ROE processing" % nsId_tmp])    
     log_queue.put(["INFO", "SCALING FINISHED :)"])
 
 
@@ -901,7 +1220,7 @@ def terminate_ns(nsId):
     name: type
         return description
     """
-    log_queue.put(["INFO", "*****Time measure: ROE Starting ROE processing to terminate"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE terminating service" % (nsId)])
     if (nsId.find('_') == -1):
         status = ns_db.get_ns_status(nsId)
         ns_db.set_ns_status(nsId, "TERMINATING")
@@ -917,10 +1236,10 @@ def terminate_ns(nsId):
         # tell the mano to terminate
         coreMano = createWrapper()
         coreMano.terminate_ns(nsId)
-        log_queue.put(["INFO", "*****Time measure: ROE ROE, terminated VNFs"])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE-OSMW terminated VNFs" % (nsId)])
         # ask network execution engine to deploy the virtual links
         eenet.uninstall_vls(nsId)
-        log_queue.put(["INFO", "*****Time measure: ROE ROE, terminated VLs at MTP"])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE terminated VLs at RL"% (nsId)])
 
     # remove the information from the nsir
     nsir_db.delete_nsir_record(nsId)
@@ -933,5 +1252,7 @@ def terminate_ns(nsId):
         log_queue.put(["INFO", "Removing a single NS"])
         operationId = operation_db.get_operationId(nsId, "TERMINATION")
         operation_db.set_operation_status(operationId, "SUCCESSFULLY_DONE")
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE updated DBs"% (nsId)])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: ROE ROE terminated service" % (nsId)])
     log_queue.put(["INFO", "TERMINATION FINISHED :)"])
 

@@ -27,6 +27,7 @@ from swagger_server.models.federated_info import FederatedInfo  # noqa: E501
 from swagger_server.models.inline_response2001 import InlineResponse2001  # noqa: E501
 from swagger_server.models.inline_response2002 import InlineResponse2002  # noqa: E501
 from swagger_server.models.interconnection_paths import InterconnectionPaths  # noqa: E501
+from swagger_server.models.update_interconnection_paths import UpdateInterconnectionPaths  # noqa: E501
 from swagger_server import util
 from swagger_server.models.http_errors import error400, error404
 
@@ -98,6 +99,27 @@ def federated_network_info(nsId, body):  # noqa: E501
     requester = connexion.request.remote_addr
     networkInfo = crooe.get_federated_network_info_reply(nsId, body.nsd_id,requester)
     if networkInfo == 404:
-        return error404("The requests coming from the federated domain is not returning valid information")
+        return error404("The requests coming from the federated domain are not returning valid information")
     log_queue.put(["DEBUG", "EWBI network_info: %s"%networkInfo])
     return {"networkInfo": networkInfo}
+
+def update_federated_connections_paths(nsId, body):  # noqa: E501
+    """Query towards the federated/provider domain to update connections towards the local and other federate domains after a scaling operation
+
+     # noqa: E501
+
+    :param nsId: nsId of the nested federated network service in federated domain
+    :type nsId: str
+    :param body: Set of pairs of interconnections between VNFs to be established or removed
+    :type body: dict | bytes
+
+    :rtype: None
+    """
+    if connexion.request.is_json:
+        body = UpdateInterconnectionPaths.from_dict(connexion.request.get_json())  # noqa: E501
+    requester = connexion.request.remote_addr
+    pathInfo = crooe.update_federated_internested_connections_reply(nsId, body, requester)
+    if pathInfo == 404:
+        return error404("The update requests coming from the federated domain are not returning valid information")
+    log_queue.put(["DEBUG", "EWBI UPDATED pathInfo: %s"%pathInfo])
+    return {"updatedPathInfo": pathInfo}

@@ -1,0 +1,113 @@
+{
+	"vnfdId": "probeserver",
+	"vnfProvider": "ATOS",
+	"vnfProductName": "probeserver",
+	"vnfSoftwareVersion": "0.1",
+	"vnfdVersion": "0.2",
+	"vnfProductInfoName": "vCDN probeserver",
+	"vnfProductInfoDescription": "vCDN Probe Server ",
+	"vnfmInfo": ["vEPC_VNFM"],
+	"vdu": [{
+		"vduId": "probeserver_vdu",
+		"name": "probeserver",
+		"description": "VDU of the probeserver",
+		"intCpd": [{
+			"cpdId": "probeProbeInt",
+			"layerProtocol": "IPV4",
+			"description": "CP for the media content distribution",
+			"addressData": [{
+				"addressType": "IP_ADDRESS",
+				"iPAddressAssignment": false,
+				"floatingIpActivated": true,
+				"management": true,
+				"iPAddressType": "IPv4",
+				"numberOfIpAddress": 1
+			}]
+		}],
+		"virtualComputeDesc": "VCD_probeserver",
+		"virtualStorageDesc": ["VSD_probeserver"],
+		"swImageDesc": {
+			"id": "CDN_probeserver_SWID",
+			"name": "probeserver_open",
+			"user_image": "ubuntu",
+			"version": "0.1",
+			"checksum": "TBD",
+			"containerFormat": "QCOW",
+			"diskFormat": "QCOW",
+			"minDisk": 1,
+			"minRam": 1,
+			"size": 10,
+			"swImage": "xenial-server-cloudimg-amd64-disk1",
+			"operatingSystem": "Ubuntu-10.04"
+		},
+		"configurableProperties": {}
+	}],
+	"virtualComputeDesc": [{
+		"virtualComputeDescId": "VCD_probeserver",
+		"virtualMemory": {
+			"virtualMemSize": 4,
+			"virtualMemOversubscriptionPolicy": "asdasd",
+			"numaEnabled": false
+		},
+		"virtualCpu": {
+			"numVirtualCpu": 1,
+			"cpuArchitecture": "x86_64",
+			"virtualCpuClock": 0,
+			"virtualCpuOversubscriptionPolicy": "asdasd"
+		}
+
+	}],
+	"virtualStorageDesc": [{
+		"id": "VSD_probeserver",
+		"typeOfStorage": "VOLUME",
+		"sizeOfStorage": 10,
+		"swImageDesc": "CDN_probeserver_SWID"
+	}],
+	"vnfExtCpd": [{
+		"cpdId": "probeProbeExt",
+		"layerProtocol": "IPV4",
+		"description": "External CP for the media content distribution",
+		"addressData": [{
+			"addressType": "IP_ADDRESS",
+			"iPAddressAssignment": false,
+			"floatingIpActivated": true,
+			"management": true,
+			"iPAddressType": "IPv4",
+			"numberOfIpAddress": 1
+		}],
+		"intCpd": "probeProbeInt"
+	}],
+	"deploymentFlavour": [{
+		"flavourId": "df_probeserver",
+		"description": "Standard deployment flavour of the CDN probeserver",
+		"vduProfile": [{
+			"vduId": "probeserver_vdu",
+			"minNumberOfInstances": 1,
+			"maxNumberOfInstances": 1
+		}],
+		"instantiationLevel": [{
+			"levelId": "il_probeserver",
+			"description": "Standard instantiation level of the CDN probeserver",
+			"vduLevel": [{
+				"vduId": "probeserver_vdu",
+				"numberOfInstances": 1
+			}]
+		}],
+		"vnfLcmOperationsConfiguration": {}
+	}],
+
+	"modifiableAttributes": {},
+	"lifeCycleManagementScript": [{
+		"event": ["START_VNF_INSTANTIATION"],
+		"script": ""
+	}, {
+		"event": ["END_VNF_INSTANTIATION"],
+		"script": ""
+	}, {
+		"event": ["START_VNF_TERMINATION"],
+		"script": ""
+	}, {
+		"event": ["END_VNF_TERMINATION"],
+		"script": ""
+	}]
+}

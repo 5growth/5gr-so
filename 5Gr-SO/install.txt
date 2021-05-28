@@ -41,6 +41,8 @@ Usage
 To run the server, execute the following from the "5Gr-SO/nbi/python-flask-server" directory:
 
 pip3 install -r requirements.txt  # only the first time
+python3 create_admin_user.py  # only the first time in order to create the "admin" user to access the GUI
+
 python3 -m swagger_server
 
 by open your browser to here:

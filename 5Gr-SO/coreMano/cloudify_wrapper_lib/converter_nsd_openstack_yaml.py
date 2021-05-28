@@ -15,7 +15,8 @@ import os
 from collections import OrderedDict
 from configparser import RawConfigParser
 config = RawConfigParser()
-config.read("../../coreMano/coreMano.properties")
+resource_root = os.path.dirname(__file__)
+config.read(resource_root + "/../../coreMano/coreMano.properties")
 pa_pa_enable = config.get("PA", "pa_enable")
 pa_pa_simulate = config.get("PA", "pa_simulate")
 

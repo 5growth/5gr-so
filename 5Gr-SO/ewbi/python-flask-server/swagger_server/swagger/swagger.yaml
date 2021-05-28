@@ -113,6 +113,38 @@ paths:
         500:
           description: "Internal Error"
       x-swagger-router-controller: "swagger_server.controllers.federated_service_controller"
+    put:
+      tags:
+      - "federated network service"
+      summary: "Query towards the federated/provider domain to update connections\
+        \ towards the local and other federate domains after a scaling operation"
+      description: ""
+      operationId: "update_federated_connections_paths"
+      produces:
+      - "application/json"
+      parameters:
+      - name: "nsId"
+        in: "path"
+        description: "nsId of the nested federated network service in federated domain"
+        required: true
+        type: "string"
+      - in: "body"
+        name: "body"
+        description: "Set of pairs of interconnections between VNFs to be established\
+          \ or removed"
+        required: true
+        schema:
+          $ref: "#/definitions/UpdateInterconnectionPaths"
+      responses:
+        200:
+          description: "successful operation"
+        400:
+          description: "Bad Request"
+        404:
+          description: "Not found"
+        500:
+          description: "Internal Error"
+      x-swagger-router-controller: "swagger_server.controllers.federated_service_controller"
 definitions:
   FederatedInfo:
     type: "object"
@@ -144,6 +176,48 @@ definitions:
           - "192.168.20.78"
         - - "IP2l"
           - "IP2f"
+  UpdateInterconnectionPaths:
+    type: "object"
+    required:
+    - "connectedVNFs_add"
+    - "connectedVNFs_del"
+    - "linkChar"
+    - "nsdId"
+    properties:
+      nsdId:
+        type: "string"
+      connectedVNFs_add:
+        $ref: "#/definitions/KeyValuePair"
+      connectedVNFs_del:
+        $ref: "#/definitions/KeyValuePair"
+      linkChar:
+        $ref: "#/definitions/KeyValuePair"
+    example:
+      nsdId: "eHealth_vEPC"
+      connectedVNFs_add:
+        virtual_link_a:
+        - - "192.168.20.1"
+          - "192.168.20.78"
+        - - "IP2l"
+          - "IP2f"
+        virtual_link_b:
+        - - "192.168.10.35"
+          - "192.168.10.21"
+        - - "IP2l"
+          - "IP2f"
+      connectedVNFs_del:
+        virtual_link_b:
+        - - "192.168.20.8"
+          - "192.168.20.74"
+        - - "IP2l"
+          - "IP2f"
+      linkChar:
+        virtual_link_a:
+          bw: "10"
+          latency: "5"
+        virtual_link_b:
+          bw: "10"
+          latency: "10"
   inline_response_200_1:
     type: "object"
     required:

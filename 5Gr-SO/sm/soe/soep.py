@@ -23,6 +23,7 @@ from pymongo import MongoClient
 from json import dumps, loads, load
 from six.moves.configparser import RawConfigParser
 from http.client import HTTPConnection
+from datetime import datetime
 import sys
 import time
 import wget
@@ -36,7 +37,9 @@ from db.ns_db import ns_db
 from db.nsd_db import nsd_db
 from db.vnfd_db import vnfd_db
 from db.appd_db import appd_db
+from db.pnfd_db import pnfd_db
 from db.operation_db import operation_db
+from db.notification_db import notification_db
 from sm.soe import soe
 from nbi import log_queue
 from monitoring import monitoring, alert_configure
@@ -119,9 +122,254 @@ def check_df_compatibilities(nested_record, composite_nsd_json, body):
                                     return True
     return False
 
+def check_new_df_compatibilities_scaling(body, composite_ns_info):
+   """
+   This function checks the current state of the NS and the desired state after the scaling operation, so 
+   it provides the new instantiation levels for each of the involved nested, classifying the information between
+   into local or federated nested. It also checks that in the case of existing a reference, it checks that the target_il
+   is not disturbing it instantiation level
+   Parameters
+   ----------
+   body: struct
+       Body of the request to extract the target il to compare with current state 
+   composite_ns_info: list
+       Each element of this list is a dict containing the info regarding the different instantiation info parameters of a nested
+   Returns
+   -------
+   local_il_changes_list: list
+       This list contains a dict for each local nested to be modified. This dict contains current_df, current_il and target_il, doamin, nested_instance_id
+   federation_il_changes_list: list
+       This list contains a dict for each federated nested to be modified. This dict contains current_df, current_il and target_il, domain, nested_instance_id
+   reference_il_list: list
+       This list contains a dict with the reference_df, the reference_il of the NS used as a reference to complement the composite NS
+   """
+
+   local_services = []
+   federated_services = []
+   nested_ns_instance = {}
+   reference_nsId = None
+   reference_nsdId = None
+   reference_il = None
+   reference_df = None
+   local_il_changes_list = []
+   federation_il_changes_list = []
+   reference_il_list = []
+   if ('nestedNsId' in composite_ns_info):
+       #it means it has a reference, we assume only one
+       reference_nsId = composite_ns_info["nestedNsId"]
+       reference_nsdId = ns_db.get_nsdId(reference_nsId)
+       reference_il = ns_db.get_ns_il(reference_nsId)
+       reference_df = ns_db.get_ns_flavour_id(reference_nsId)
+       reference_il_list.append({reference_nsdId : [reference_df, reference_il, "local", reference_nsId]})
+       # creating the variable to next check the pairs
+       nested_ns_instance[reference_nsdId] = reference_nsId
+   # if we do not enter, it means the composite has been instantiated from scratch
+   composite_nsd_json = nsd_db.get_nsd_json(composite_ns_info['nsd_id'], None)
+   composite_current_df = composite_ns_info['flavourId']
+   composite_current_il = composite_ns_info['nsInstantiationLevelId']
+   composite_target_il =  body.scale_ns_data.scale_ns_to_level_data.ns_instantiation_level
+   composite_new_profiles = []
+   # log_queue.put(["DEBUG", "composite_current_df: %s"%composite_current_df])
+   # log_queue.put(["DEBUG", "composite_current_il: %s"%composite_current_il])
+   # log_queue.put(["DEBUG", "composite_target_il: %s"%composite_target_il])
+
+   for df in composite_nsd_json["nsd"]["nsDf"]:
+       if (df["nsDfId"] == composite_current_df):
+           for il in df["nsInstantiationLevel"]:
+               # log_queue.put(["DEBUG", "comparando il: %s con target_il: %s"%(il["nsLevelId"],composite_target_il)])
+               if (il["nsLevelId"] == composite_target_il):
+                    # log_queue.put(["DEBUG", "composite_target_il_2: %s"%composite_target_il])
+                    for nsmap in il["nsToLevelMapping"]:
+                        composite_new_profiles.append(nsmap["nsProfileId"])
+           # log_queue.put(["DEBUG", "Checking composite profiles: %s"%composite_new_profiles])
+           for profile in df["nsProfile"]:
+               if (profile["nsProfileId"] in composite_new_profiles):
+                   if (profile["nsdId"] == reference_nsdId):
+                       if (profile["nsInstantiationLevelId"] != reference_il and profile["nsDfId"] == reference_df):
+                           # this scaling operation is changing the reference, it is not valid
+                           return [None, None, None, None, None, None]
+                   else:
+                       nested_info = composite_ns_info["nested_service_info"]
+                       for nested in range(0, len(nested_info)):
+                           if (nested_info[nested]["nested_id"] == profile["nsdId"] and nested_info[nested]["nested_df"] == profile["nsDfId"]):
+                               if (nested_info[nested]['domain'] == "local"):
+                                   local_services.append({"nsd": nested_info[nested]["nested_id"], "domain": "local"})
+                                   # now, we check if the current and the target_il are the same
+                                   if (nested_info[nested]['nested_il'] != profile["nsInstantiationLevelId"]):
+                                       local_il_changes_list.append({profile["nsdId"] : [nested_info[nested]["nested_df"], nested_info[nested]['nested_il'], profile["nsInstantiationLevelId"], nested_info[nested]['domain'], nested_info[nested]['nested_instance_id']]})
+                               else:
+                                   federated_services.append({"nsd": nested_info[nested]["nested_id"], "domain": nested_info[nested]['domain']})
+                                   # now, we check if the current and the target_il are the same
+                                   if (nested_info[nested]['nested_il'] != profile["nsInstantiationLevelId"]):
+                                       federation_il_changes_list.append({profile["nsdId"] : [nested_info[nested]["nested_df"], nested_info[nested]['nested_il'], profile["nsInstantiationLevelId"], nested_info[nested]['domain'], nested_info[nested]['nested_instance_id']]})
+                           # save the provider, just in case
+   # the return variable is a list of dictionary that in local_il and federation_il have the following structure {nsId: [current_df, current_il, target_il, domain, nested_instance_id] }
+   # for the reference_il_list, since it cannot change, it is: {nsId: [current_df, current_il, domain]}
+   return [local_il_changes_list, federation_il_changes_list, reference_il_list, local_services, federated_services, nested_ns_instance]
+
+def determine_new_il_composite_scaling(body, composite_ns_info, auto_instance_Id):
+    # we are in the case of an autoscaling operation either local or federated, but which one? (we use its reference)
+    # from the composite we need to 
+    local_services = []
+    federated_services = []
+    nested_ns_instance = {}
+    reference_nsId = None
+    reference_nsdId = None
+    reference_il = None
+    reference_df = None
+    local_il_changes_list = []
+    federation_il_changes_list = []
+    reference_il_list = []
+    target_il = None
+    ref_autoscaling = False
+    if ('nestedNsId' in composite_ns_info):
+        #it means it has a reference, we assume only one 
+        if (composite_ns_info["nestedNsId"] == auto_instance_Id):
+            ref_autoscaling = True
+            log_queue.put(["DEBUG", "The reference is scaling"])
+            # not needed, in the case of autoscaling the reference, we have entered after the 
+            # reference is scaled, so its il is updated
+            # reference_il = body.scale_ns_data.scale_ns_to_level_data.ns_instantiation_level
+        # else:
+            # reference_il = ns_db.get_ns_il(reference_nsId)            
+
+        reference_nsId = composite_ns_info["nestedNsId"]
+        reference_nsdId = ns_db.get_nsdId(reference_nsId)
+        reference_il = ns_db.get_ns_il(reference_nsId)            
+        reference_df = ns_db.get_ns_flavour_id(reference_nsId)
+        reference_il_list.append({reference_nsdId : [reference_df, reference_il, "local", reference_nsId]})
+        # creating the variable to next check the pairs
+        nested_ns_instance[reference_nsdId] = reference_nsId
+
+    composite_nsd_json = nsd_db.get_nsd_json(composite_ns_info['nsd_id'], None)
+    composite_current_df = composite_ns_info['flavourId']
+    composite_current_il = composite_ns_info['nsInstantiationLevelId']
+    nested_info={}
+
+    if (ref_autoscaling == True):
+        # here I create a nested_info_like variable but with the characteristics of the reference
+        nested_info["nested_id"] = reference_nsdId
+        nested_info["nested_df"] = reference_df
+        nested_info["nested_il"] = reference_il
+        nested_info["domain"] = "local" # for the moment, references are local
+        nested_info["nested_instance_id"] = composite_ns_info["nestedNsId"]
+    else:
+        for nested in composite_ns_info["nested_service_info"]:
+            if nested["nested_instance_id"] == auto_instance_Id:
+                nested_info = nested
+                log_queue.put(["DEBUG", "Autoscaling the following NESTED: %s"%(dumps(nested_info))])
+
+    if (nested_info):
+        # auto-scaling comes from a nested within a composite, not a reference
+        nested_id = nested_info["nested_id"]
+        nested_df = nested_info["nested_df"]
+        nested_domain = nested_info["domain"]
+        current_nested_il = nested_info["nested_il"]
+        target_nested_il = body.scale_ns_data.scale_ns_to_level_data.ns_instantiation_level
+        for df in composite_nsd_json["nsd"]["nsDf"]:
+            if (df["nsDfId"] == composite_current_df):
+                for profile in df["nsProfile"]:
+                    if ((profile["nsdId"] == nested_id) and (profile["nsDfId"] == nested_df) and (profile["nsInstantiationLevelId"] == target_nested_il)):
+                        target_nested_profile = profile["nsProfileId"]
+                        log_queue.put(["DEBUG", "The matching is with nsdId: %s"% profile["nsdId"]])
+                        if ( (ref_autoscaling == False) or (ref_autoscaling == True and nested_id != reference_nsdId) ):
+                        #if (nested_domain == 'local' or (ref_autoscaling == True and profile["nsdId"] !=reference_nsdId) ):
+                            if (nested_domain == 'local'):
+                                local_il_changes_list.append({nested_id : [nested_df, current_nested_il, target_nested_il, nested_domain, nested_info['nested_instance_id']]})
+                        #if (nested_domain != 'local' or (ref_autoscaling == True and profile["nsdId"] !=reference_nsdId) ):
+                            else:
+                                federation_il_changes_list.append({nested_id : [nested_df, current_nested_il, target_nested_il, nested_domain, nested_info ['nested_instance_id']]})
+                        log_queue.put(["DEBUG", "The target nested profile is: %s"%target_nested_profile])
+                        break
+                break
+        # now construct the dict possibleLevelId -> profiles
+        nsLevel_to_profile = {}
+        for df in composite_nsd_json["nsd"]["nsDf"]:
+            if (df["nsDfId"] == composite_current_df):
+                for levelId in df["nsInstantiationLevel"]:
+                    if levelId["nsLevelId"] not in nsLevel_to_profile:
+                        nsLevel_to_profile[levelId["nsLevelId"]] = []
+                        found = 0
+                    for profile in levelId["nsToLevelMapping"]:
+                        nsLevel_to_profile[levelId["nsLevelId"]].append(profile["nsProfileId"])
+                        if (profile["nsProfileId"] == target_nested_profile):
+                            found = 1
+                    if (found == 0):
+                        del nsLevel_to_profile[levelId["nsLevelId"]]
+        log_queue.put(["DEBUG", "los profiles a investigar son: %s"%dumps(nsLevel_to_profile)])
+        if not nsLevel_to_profile:
+            # if there are no keys, something wrong happens, not compatible -> however you need to erase composite
+            return [None, None, None, None, None, None, None]
+        nsLevel_rank={}
+        log_queue.put(["DEBUG", "El nested_id: %s, nested_df: %s, target_nested_il: %s"%(nested_id, nested_df, target_nested_il)])
+        for df in composite_nsd_json["nsd"]["nsDf"]:
+            if (df["nsDfId"] == composite_current_df):
+               for level in nsLevel_to_profile.keys():
+                   log_queue.put(["DEBUG", "Considered Profile Level: %s"%level])
+                   if level not in nsLevel_rank:
+                       nsLevel_rank[level] = 0
+                   for profile in nsLevel_to_profile[level]:
+                     log_queue.put(["DEBUG", "el profile considerado es: %s"% profile])
+                     for profile_d in df["nsProfile"]:
+                         if (profile_d["nsProfileId"] == profile):
+                            candidate_nsdId = profile_d["nsdId"]
+                            candidate_df = profile_d["nsDfId"]
+                            candidate_il = profile_d["nsInstantiationLevelId"]
+                            log_queue.put(["DEBUG", "El nested_id: %s, nested_df: %s, target_nested_il: %s"%(candidate_nsdId, candidate_df, candidate_il)])
+                            if ( (nested_id == candidate_nsdId) and ( nested_df == candidate_df) and (target_nested_il == candidate_il) ):
+                                # this is the case to check with the one which is auto-scaling
+                                log_queue.put(["DEBUG", "Summing ONE AUTOSCALING to level: %s and candidate_il: %s"%(level, candidate_il)])
+                                nsLevel_rank[level] = nsLevel_rank[level] + 1
+                                if (ref_autoscaling == False):
+                                    if (nested_domain == "local"):
+                                        if ( ({"nsd": nested_id, "domain": nested_domain}) not in local_services):
+                                            local_services.append({"nsd": nested_id, "domain": nested_domain})
+                                    else:
+                                        if ( ({"nsd": nested_id, "domain": nested_domain}) not in federated_services):
+                                            federated_services.append({"nsd": nested_id, "domain": nested_domain})
+                            else:
+                                for nested_elem in composite_ns_info["nested_service_info"]:
+                                    if ( (nested_elem["nested_id"] == candidate_nsdId) and (nested_elem["nested_df"] == candidate_df) \
+                                         and (nested_elem["nested_il"] == candidate_il) ):
+                                       # this is the case, we compare with the rest of nested in the service 
+                                       log_queue.put(["DEBUG", "Summing ONE to level: %s and candidate_il: %s"%(level, candidate_il)])
+                                       nsLevel_rank[level] =  nsLevel_rank[level] + 1
+                                       # break -> otherwise I cannot populate the variables
+                                    # I take profit of this loop to populate local_services and federated_services variables
+                                    if ( (ref_autoscaling == False) or (ref_autoscaling == True and nested_elem["nested_id"] != reference_nsdId) ):
+                                        if (nested_elem["domain"] == "local"):
+                                            if ( ({"nsd": nested_elem["nested_id"], "domain": nested_elem["domain"]}) not in local_services):
+                                                local_services.append({"nsd": nested_elem["nested_id"], "domain": nested_elem["domain"]})
+                                        else:
+                                            if ( ({"nsd": nested_elem["nested_id"], "domain": nested_elem["domain"]}) not in federated_services):
+                                                federated_services.append({"nsd": nested_elem["nested_id"], "domain": nested_elem["domain"]}) 
+                                # in the case not autoscaling the reference:
+                                if (reference_il_list):
+                                    if ( (reference_nsdId == candidate_nsdId) and ( reference_df == candidate_df) and ( reference_il == candidate_il) ):
+                                        nsLevel_rank[level] = nsLevel_rank[level] + 1
+        max_il = -1
+        target_il = None
+        for level in nsLevel_rank.keys():
+           log_queue.put(["DEBUG", "The IL for the COMPOSITE is: %s and its rank is: %s"%(level, nsLevel_rank[level])]) 
+           if (nsLevel_rank[level] > max_il):
+               max_il = nsLevel_rank[level]
+               target_il = level
+        if (max_il == 0):
+            #it means it is not compatible or it is not a good profile so we must discard it
+            return [None, None, None, None, None, None, None]
+    else:
+        #there is no nested variable, the reference of the auto-scaling service is wrong
+        return [None, None, None, None, None, None, None]
+    log_queue.put(["DEBUG", "The selecte IL for the COMPOSITE is: %s and its rank is: %s"%(target_il, max_il)]) 
+    return [target_il, local_il_changes_list, federation_il_changes_list, reference_il_list, local_services, federated_services, nested_ns_instance]
+
+# local_services.append({"nsd": nested_info[nested]["nested_id"], "domain": "local"})
+# federated_services.append({"nsd": nested_info[nested]["nested_id"], "domain": nested_info[nested]['domain']})
+
 def define_new_body_for_composite(nsId, nsdId, body):
     """
-    Function description
+    This function creates a new body struct to instantiate the corresponding nested 
+    either at consumer or at provider domain
     Parameters
     ----------
     nsId: string
@@ -132,7 +380,7 @@ def define_new_body_for_composite(nsId, nsdId, body):
         Identifier of the nested service to be instantiated, only available when 
     Returns
     -------
-    name: struct
+    body_tmp: struct
         Object with the appropriate df and il according to the request
     """
     body_tmp = copy.deepcopy(body)
@@ -157,6 +405,25 @@ def define_new_body_for_composite(nsId, nsdId, body):
                                 body_tmp.ns_instantiation_level_id = nsprof["nsInstantiationLevelId"]
                                 return body_tmp
 
+def define_new_body_scaling_for_composite(nested, body):
+    """
+    This function creates a new body struct to scale the corresponding nested 
+    either at consumer or at provider domain
+    Parameters
+    ----------
+    nested: dict
+        This dict contains (between other elements) the target_il for the corresponding nested
+    body: struct
+        Object having the target il for the composite NS.
+    Returns
+    -------
+    body_tmp: struct
+        Object with the appropriate scaling target il according to the initial request
+    """
+    body_tmp = copy.deepcopy(body)
+    target_il = nested[next(iter(nested))][2]
+    body_tmp.scale_ns_data.scale_ns_to_level_data.ns_instantiation_level = target_il
+    return body_tmp
 
 def exists_nsd(nsdId):
     """
@@ -248,10 +515,45 @@ def scale_ns_provider (nsId_n, body, domain, additionalParams=None):
         conn.request("PUT", path, dumps(data), headers)
         conn.sock.settimeout(timeout)
         rsp = conn.getresponse()
-        data = rsp.read().decode()
+        data = rsp.read().decode("utf-8")
         data = loads(data)
+        log_queue.put(["DEBUG", "Response from 5Gr-SO on Scale request are:"])
+        log_queue.put(["DEBUG", dumps(data, indent=4)])
         operationId = data["operationId"]
     return [operationId, conn, target_il]
+
+
+def scale_ns_consumer(nsId, body, domain, operationId):
+    #in case of autoscaling of a federated nested service, trigger the update at the consumer
+    path = "/5gt/so/v1/ns/" + nsId + "/scale"
+    target_il = body.scale_ns_data.scale_ns_to_level_data.ns_instantiation_level
+    scale_request ={
+        "scaleType": "SCALE_NS",
+        "scaleNsData": {
+          "scaleNsToLevelData": {
+             "nsInstantiationLevel": target_il
+          },
+          "additionalParamForNs": {
+           "operationId": operationId
+          }
+        },
+        "scaleTime": "0"
+    }
+    body_def=dumps(scale_request)
+    try:
+        conn = HTTPConnection(domain, port, timeout=timeout)
+        #conn.request("PUT", path, body, headers)
+        conn.request("PUT", path, body_def, headers)
+        rsp = conn.getresponse()
+        resources = rsp.read()
+        resp_scale = resources.decode("utf-8")
+        resp_scale = loads(resp_scale)
+        log_queue.put(["DEBUG", "Response from SO on Scale request are:"])
+        log_queue.put(["DEBUG", dumps(resp_scale, indent=4)])
+        conn.close()
+    except ConnectionRefusedError:
+        # the SO on Scale request returned wrong response
+        log_queue.put(["ERROR", "SO on Scale request returned wrong response"])
 
 
 def terminate_ns_provider(nsId, domain):
@@ -267,25 +569,37 @@ def terminate_ns_provider(nsId, domain):
     operationId = data["operationId"]
     return [operationId, conn]
 
-def get_operation_status_provider(operationId, conn):
+def get_operation_status_provider(operationId, conn=None, domain=None):
     path = "/5gt/so/v1/operation/" + operationId
-    conn.request("GET", path, None, headers)
-    conn.sock.settimeout(timeout)
-    rsp = conn.getresponse()
+    if (conn== None):
+        # we are in the case of provider auto-scaling case 
+        connect = HTTPConnection(domain, port, timeout=timeout)
+    else:
+        connect = conn
+    connect.request("GET", path, None, headers)
+    connect.sock.settimeout(timeout)
+    rsp = connect.getresponse()
     data = rsp.read().decode()
     log_queue.put(["INFO", "get_operation_status_provider data: %s" % (data)])
     data = loads(data)
+    if (conn== None):
+        connect.close()
     return data['status']
 
-def get_sap_info_provider(nsId_n, conn): 
+def get_sap_info_provider(nsId_n, conn=None, domain=None): 
     path = "/5gt/so/v1/ns/" + nsId_n
-    conn.request("GET", path, None, headers)
-    conn.sock.settimeout(timeout)
-    rsp = conn.getresponse()
+    if (conn== None):
+        # we are in the case of provider auto-scaling case 
+        connect = HTTPConnection(domain, port, timeout=timeout)
+    else:
+        connect = conn
+    connect.request("GET", path, None, headers)
+    connect.sock.settimeout(timeout)
+    rsp = connect.getresponse()
     data = rsp.read().decode()
     data = loads(data)
     sapInfo = data["queryNsResult"][0]["sapInfo"]
-    conn.close()
+    connect.close()
     return sapInfo
 
 
@@ -312,6 +626,33 @@ def generate_nested_sap_info(nsId, nsd_name):
         else: 
             return None
 
+def transform_nested_sap_info(nested_sap_info): 
+    """
+    This method gets the nested sap info and returns a dict as if it was the sapInfo from a single NS.
+    Parameters
+    ----------
+    nested_sap_info: dict
+        Sap_info registry from a nested NS in a composite process
+    Returns
+    -------
+    dict
+        Formatted information of the sapInfo element as it was a single NS.
+    """
+    # Example of a sap from a single NS:"sapInfo" : { "mgt_vepc_sap" : [ { "HSS_VNF" : "10.20.30.6" }, { "PGW_VNF" : "10.20.30.17" }, { "SECGW_VNF" : "10.20.30.7" },   
+    # { "MME_VNF" : "10.20.30.16" }, { "SGW_VNF" : # "10.20.30.21" }, { "SERVER_VNF" : "10.20.30.20" } ] }
+    # Example of a sap from a nested NS: [{'sapInstanceId': '0', 'description': 'Mgmt SAP', 'sapdId': 'mgt_vepc_sap', 'address': 'test for future', 'sapName': 'mgt_vepc_sap',
+    # 'userAccessInfo': [{'vnfdId': 'MME_VNF', 'sapdId': 'mgt_vepc_sap', 'address': '10.20.30.16'}, {'vnfdId': 'PGW_VNF', 'sapdId': 'mgt_vepc_sap', 'address': '10.20.30.17'},
+    # {'vnfdId': 'SERVER_VNF', 'sapdId': 'mgt_vepc_sap', 'address': '10.20.30.20'}, {'vnfdId': 'HSS_VNF', 'sapdId': 'mgt_vepc_sap', 'address': '10.20.30.6'}, {'vnfdId':
+    # 'SGW_VNF', 'sapdId': 'mgt_vepc_sap', 'address': '10.20.30.21'}, {'vnfdId': 'SECGW_VNF', 'sapdId': 'mgt_vepc_sap', 'address': '10.20.30.7'}]}]
+    sapInfo = {}
+    for sapdescription in nested_sap_info:
+        if sapdescription["sapdId"] not in sapInfo:
+            sapInfo[sapdescription["sapdId"]] = []
+            for info in sapdescription["userAccessInfo"]:
+                if (info["sapdId"] == sapdescription["sapdId"]):
+                    sapInfo[sapdescription["sapdId"]].append({info["vnfdId"] : info["address"]})
+    return sapInfo
+
 def instantiate_ns_process(nsId, body, requester):
     """
     The process to instantiate the Network Service associated to the instance identified by "nsId".
@@ -326,7 +667,7 @@ def instantiate_ns_process(nsId, body, requester):
     -------
     None
     """
-    log_queue.put(["INFO", "*****Time measure: SOEp SOEp decomposing NS"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp decomposing NS" % (nsId)])
     # get the nsdId that corresponds to nsId
     nsdId = ns_db.get_nsdId(nsId)
     # first get the ns and vnfs descriptors
@@ -370,7 +711,7 @@ def instantiate_ns_process(nsId, body, requester):
                 if (nsd["nsd"] == nested_record["nsd_id"]):
                     nested_instance[nsd["nsd"]] = body.nested_ns_instance_id[0]
                     local_services.remove(nsd)
-    log_queue.put(["INFO", "*****Time measure: SOEp SOEp finished decomposing NS and checking references"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp finished decomposing NS and checking references" % (nsId)])
     if "nestedNsdId" in nsd_json["nsd"].keys():
         [network_mapping, renaming_networks] = crooe.mapping_composite_networks_to_nested_networks(nsId, nsd_json, body, nested_instance) 
     else:
@@ -378,23 +719,29 @@ def instantiate_ns_process(nsId, body, requester):
         network_mapping = {}
         renaming_networks = {}
 
-    log_queue.put(["INFO", "*****Time measure: SOEp CROOE finished checking interconnection nested NS and checking references"])
-    log_queue.put(["INFO", "*****Time measure: SOEp SOEp instantiating local nested NSs"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp CROOE finished checking interconnection nested NS and checking references"% (nsId)])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp instantiating local nested NSs"% (nsId)])
     for nsd in local_services:
-        log_queue.put(["INFO", "*****Time measure: SOEp instantiating local nested NSs %s"%index])
+        #log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp instantiating local nested NSs %s"%(nsId,index)])
         if (requester != "local"):
             # in that case, we only iterate once, this is the part of the federated service in the provider domain
-            networkInfo = crooe.get_federated_network_info_request(body.additional_param_for_ns["nsId"], 
-                          nsd['nsd'], requester, ewbi_port, ewbi_path)
-            log_queue.put(["INFO", "*****Time measure: SOEp SOEp receiving networkInfo from local CROOE for nested with index %s"%index])
-            log_queue.put(["INFO", "SOEp getting information of the consumer domain from the EWBI: %s" %networkInfo])
-            # we need to save the network_mapping for a next iteration with the ewbi after the federated service has been instantiated
-            log_queue.put(["INFO", "SOEp passing info to instantiate_ns_process"])
-            log_queue.put(["INFO", dumps({nsd["nsd"]:[loads(body.additional_param_for_ns["network_mapping"]), networkInfo]},indent=4)])
-            soe.instantiate_ns_process(nsId, body, {nsd["nsd"]:[loads(body.additional_param_for_ns["network_mapping"]), networkInfo]})
+            if (body.additional_param_for_ns):
+                networkInfo = crooe.get_federated_network_info_request(body.additional_param_for_ns["nsId"], 
+                              nsd['nsd'], requester, ewbi_port, ewbi_path)
+                log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp received networkInfo from local CROOE for nested with index %s"% (nsId,index)])
+                log_queue.put(["INFO", "SOEp getting information of the consumer domain from the EWBI: %s" %networkInfo])
+                # we need to save the network_mapping for a next iteration with the ewbi after the federated service has been instantiated
+                log_queue.put(["INFO", "SOEp passing info to instantiate_ns_process"])
+                log_queue.put(["INFO", dumps({nsd["nsd"]:[loads(body.additional_param_for_ns["network_mapping"]), networkInfo]},indent=4)])
+                soe.instantiate_ns_process(nsId, body, {nsd["nsd"]:[loads(body.additional_param_for_ns["network_mapping"]), networkInfo]})
+            else:
+                # single delegated NS
+                soe.instantiate_ns_process(nsId, body)
         else: 
             # new_body = soe.define_new_body_for_composite(nsId, nsd["nsd"], body) #be careful with the pointer
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp instantiating local nested NSs %s"%(nsId,index)])
             nested_body = define_new_body_for_composite(nsId, nsd["nsd"], body) #be careful with the pointer
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp prepared nested body for local nested NSs %s"%(nsId,index)])
             nsId_nested = nsId + '_' + nsd["nsd"]
             # we have to create the info entry before to have a place where to store the sap_info
             info = { "nested_instance_id": nsId_nested,
@@ -406,6 +753,7 @@ def instantiate_ns_process(nsId, body, requester):
                    }   
             ns_db.update_nested_service_info(nsId, info, "push") 
             soe.instantiate_ns_process(nsId, nested_body, {nsd["nsd"]:[network_mapping['nestedVirtualLinkConnectivity'][nsd["nsd"]]]})
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp finished instantiating local nested NSs %s"%(nsId,index)])
             # the service is instantiated
             sapInfo = generate_nested_sap_info(nsId, nsd["nsd"])
             if (sapInfo == None):
@@ -423,15 +771,35 @@ def instantiate_ns_process(nsId, body, requester):
             info = { "status": "INSTANTIATED", #as it is coming back after instantiating
                      "sapInfo": sapInfo
                    }
+            # Scaling composite NFV-NS
+            # adding monitoring job and alert information, following same approach as with saps
+            nested_monitoring_jobs = ns_db.get_monitoring_info(nsId)
+            if (len(nested_monitoring_jobs)>0):
+                # it means that there is monitoring jobs
+                info["nested_monitoring_jobs"] = nested_monitoring_jobs
+                nested_alert_info = ns_db.get_alerts_info(nsId)
+                if (len(nested_alert_info)>0):
+                    info["nested_alert_jobs"] = nested_alert_info
+                    # now, we can set to void the alert entry
+                    ns_db.set_alert_info(nsId,{})
+                # now, we can set to void the monitoring entry
+                ns_db.set_monitoring_info(nsId,[])
             log_queue.put(["INFO", "Nested NS service instantiated with info: "])
             log_queue.put(["INFO", dumps(info,indent=4)])
             ns_db.update_nested_service_info(nsId, info, "set", nsId_nested)
-            log_queue.put(["INFO", "*****Time measure: SOEp SOEp finishing instantiating local nested NSs %s"%index])
             index = index + 1
             # clean the sap_info of the composite service, 
             ns_db.save_sap_info(nsId, "")
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp finished updating DBs local nested NSs %s"%(nsId,index)])
+            notification_db.create_notification_record({
+                "nsId": nsId_nested,
+                "type": "fa-send-o",
+                "text": nsId_nested + " INSTANTIATED LOCALLY",
+                "time": datetime.now().strftime("%d/%m/%Y %H:%M:%S.%f")
+              })
+
         
-    log_queue.put(["INFO", "*****Time measure: SOEp SOEp finished instantiating local nested NSs"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp finished instantiating local nested NSs" % nsId])
     if (requester != "local"):            
     # now I can return since the rest of interaction with the consumer domain will be done through the EWBI interface
         log_queue.put(["INFO", "SOEp instantiate_ns_process returning because the rest of the interactions"])
@@ -440,9 +808,9 @@ def instantiate_ns_process(nsId, body, requester):
 
     # federated_instance_info = []
     
-    log_queue.put(["INFO", "*****Time measure: SOEp SOEp instantiating federated nested NSs"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp instantiating federated nested NSs" % (nsId)])
     for nsd in federated_services:
-        log_queue.put(["INFO", "*****Time measure: SOEp SOEp instantiating federated nested NSs %s"%index])
+        log_queue.put(["INFO", "*****Time measure for nsId %s: SOEp SOEp instantiating federated nested NSs %s"% (nsId,index)])
         # steps:
         # 1) ask for an ns identifier to the remote domain
         name = ns_db.get_ns_name(nsId)
@@ -451,15 +819,15 @@ def instantiate_ns_process(nsId, body, requester):
         # 2) ask for the service with the provided id in step 1)
         nested_body = define_new_body_for_composite(nsId, nsd["nsd"], body)
         log_queue.put(["INFO", "SOEp generating federated nested_body: %s" % (nested_body)])
-        log_queue.put(["INFO", "*****Time measure: SOEp SOEp generating request for federated domain for nested %s"%index])
+        log_queue.put(["INFO", "*****Time measure for nsId %s: SOEp SOEp generating request for federated domain for nested %s"% (nsId,index)])
         if (len(nested_services) == 1 and len(federated_services) == 1):
             # it means it is a single delegated NS
             operationId = instantiate_ns_provider (nsId_n, conn, nested_body)
-            log_queue.put(["INFO", "*****Time measure: SOEp SOEp receiving operationId of federated nested %s"%index])
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp received operationId of federated nested %s"% (nsId,index)])
         else:
             federated_mapping = {"nsId": network_mapping["nsId"], "network_mapping": dumps(network_mapping["nestedVirtualLinkConnectivity"][nsd["nsd"]])}
             operationId = instantiate_ns_provider (nsId_n, conn, nested_body, federated_mapping)
-            log_queue.put(["INFO", "*****Time measure: SOEp SOEp receiving operationId of federated nested %s"%index])
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp received operationId of federated nested %s"%(nsId,index)])
         status = "INSTANTIATING"
         # 3) enter in a loop to wait until service is instantiated, checking with the operationid, that the operation 
         # 4) update the register of nested services instantiated
@@ -482,9 +850,9 @@ def instantiate_ns_process(nsId, body, requester):
             # it means it is not a single delegated NS
             key = next(iter(nsd["domain"]))
             log_queue.put(["INFO", "SOEp asking instantiation parameters of %s to %s"%(nsd["nsd"],nsd["domain"][key])]) 
-            log_queue.put(["INFO", "*****Time measure: SOEp SOEp asking instantiation result to federated CROOE of federated nested NSs %s"%index])
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp asking instantiation result to federated CROOE of federated nested NSs %s"% (nsId,index)])
             federated_info = crooe.get_federated_network_instance_info_request(nsId_n, nsd["nsd"], nsd["domain"][key], ewbi_port, ewbi_path)
-            log_queue.put(["INFO", "*****Time measure: SOEp SOEp receiving instantiation result to federated CROOE of federated nested NSs %s"%index])
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp receiving instantiation result to federated CROOE of federated nested NSs %s"% (nsId,index)])
             log_queue.put(["INFO", "SOEp obtained federatedInfo through EWBI: %s"%federated_info])
         # finally this information is relevant for subsequent instantiations
         # 6) update the local registry about information of the federated nested service
@@ -499,25 +867,32 @@ def instantiate_ns_process(nsId, body, requester):
                  "federatedInstanceInfo": federated_info,
                  "sapInfo": sap_info
                }
+        # Composite NFV-NS scaling: for the nested NSs in the provider domain, we do not get the monitoring information
         ns_db.update_nested_service_info(nsId, info, "push")
-        log_queue.put(["INFO", "*****Time measure: SOEp SOEp finishing instantiating federated nested NSs %s"%index])
         index = index + 1
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp  finished updating DBs federated nested NSs %s"%(nsId, index)])
+        notification_db.create_notification_record({
+            "nsId": nsId_n,
+            "type": "fa-send-o",
+            "text": nsId_n + " INSTANTIATED in FEDERATED domain" + nsd["domain"],
+            "time": datetime.now().strftime("%d/%m/%Y %H:%M:%S.%f")
+          })
 
-    log_queue.put(["DEBUG", "*****Time measure: SOEp SOEp finishing instantiating federated nested NSs"])
+    log_queue.put(["DEBUG", "*****Time measure for nsId: %s: SOEp SOEp finishing instantiating federated nested NSs" % (nsId)])
     # interconnecting the different nested between them
-    log_queue.put(["DEBUG", "*****Time measure: SOEp SOEp interconnecting nested NSs"])
+    log_queue.put(["DEBUG", "*****Time measure for nsId: %s: SOEp SOEp start interconnecting nested NSs" % (nsId)])
     if (len(nested_services) > 1):
         # in case of one, it means that it is a single delegation and you do not need to connect it
         # at least one of it will be local, so first we connect the local nested services and then we connect them with the federated
         if (len(local_services) > 1 or (len(local_services) == 1 and body.nested_ns_instance_id)):
-            log_queue.put(["INFO", "*****Time measure: SOEp SOEp-CROOE interconnecting local nested NSs"])
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp-CROOE interconnecting local nested NSs" % (nsId)])
             crooe.connecting_nested_local_services(nsId, nsd_json, network_mapping, local_services, nested_instance, renaming_networks)
-            log_queue.put(["INFO", "*****Time measure: SOEp SOEp-CROOE finishing interconnecting local nested NSs"])
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp-CROOE finished interconnecting local nested NSs" % (nsId)])
         # once local are connected, connect federated services with the local domain
         if (len(federated_services) > 0):
-            log_queue.put(["INFO", "*****Time measure: SOEp SOEp-CROOE interconnecting federated nested NSs"])
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp-CROOE interconnecting federated nested NSs" % (nsId)])
             crooe.connecting_nested_federated_local_services(nsId, nsd_json, network_mapping, local_services, federated_services, nested_instance, renaming_networks)
-            log_queue.put(["INFO", "*****Time measure: SOEp SOEp-CROOE finishing interconnecting federated nested NSs"])
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp-CROOE finished interconnecting federated nested NSs" % (nsId)])
 
     # after instantiating all the nested services, update info of the instantiation    
     operationId = operation_db.get_operationId(nsId, "INSTANTIATION")
@@ -537,9 +912,47 @@ def instantiate_ns_process(nsId, body, requester):
     # once the service is correctly instantiated, link to possible nested instances
     if (body.nested_ns_instance_id):
         ns_db.set_ns_shared_services_ids(body.nested_ns_instance_id[0], nsId)
-    log_queue.put(["INFO", "*****Time measure: SOEp SOEp finishing instantiation"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp finished instantiation composite NS" %(nsId)])
+    notification_db.create_notification_record({
+        "nsId": nsId,
+        "type": "fa-send-o",
+        "text": nsId + " INSTANTIATED",
+        "time": datetime.now().strftime("%d/%m/%Y %H:%M:%S.%f")
+      })
 
-def scale_ns_process(nsId, body):
+def scale_federated_service(nsId, nested_info, nested_id_instance, body, domain):
+
+    [operation_id, conn, target_il] = scale_ns_provider(nested_id_instance, body, domain)
+    nested_info["status"] = "SCALING"
+    ns_db.update_nested_service_info(nsId, nested_info, "set", nested_id_instance)
+    if not target_il == None:
+        # status = "INSTANTIATING"
+        status = get_operation_status_provider(operation_id, conn)
+        # 3) enter in a loop to wait until service is instantiated, checking with the operationid, that the operation 
+        # 4) update the register of nested services instantiated
+        while (status != "SUCCESSFULLY_DONE"):		
+            #status = get_operation_status_provider(operation_id, conn)
+            if (status == 'FAILED'):
+                operationIdglobal = operation_db.get_operationId(nsId, "INSTANTIATION")
+                operation_db.set_operation_status(operationIdglobal, "FAILED")
+                # set ns status as FAILED
+                ns_db.set_ns_status(nsId, "FAILED")
+                return #stop scaling: to do: to manage in case of failure
+            time.sleep(10)   
+            status = get_operation_status_provider(operation_id, conn)
+        log_queue.put(["INFO", "SOEp COMPLETE scaling operationId: %s" % (operation_id)])
+        key = next(iter(domain))
+        federated_info = crooe.get_federated_network_instance_info_request(nested_id_instance, nested_info["nested_id"], domain[key], ewbi_port, ewbi_path)
+        sap_info =  get_sap_info_provider(nested_id_instance, conn) # we close here the connection
+        #update the register in the nested
+        nested_info["sap_info"] = sap_info
+        nested_info["federatedInstanceInfo"] = federated_info
+        nested_info["nested_il"] = target_il
+        nested_info["status"] = "INSTANTIATED"
+        ns_db.update_nested_service_info(nsId, nested_info, "set", nested_id_instance)
+        return target_il
+
+def scale_ns_process(nsId, body, composite_nsIds=None):
     """
     Performs the scaling of the service identified by "nsId" according to the info at body 
     Parameters
@@ -550,47 +963,448 @@ def scale_ns_process(nsId, body):
     Returns
     -------
     """
-    # for the moment, we are only managing the scaling of single delegated network service
-    nested_service_info = ns_db.get_nested_service_info(nsId)
-    # although there is only one
-    for ns in range(0, len(nested_service_info)):
-        nested_id = ns["nested_instance_id"]
-        domain = ns["domain"]
-        [operation_id, conn, target_il] = scale_ns_provider(nested_id, body, domain)
-        if not target_il == None:
-            status = "INSTANTIATING"
-            # 3) enter in a loop to wait until service is instantiated, checking with the operationid, that the operation 
-            # 4) update the register of nested services instantiated
-            while (status != "SUCCESSFULLY_DONE"):		
-                status = get_operation_status_provider(operation_id, conn)
-                if (status == 'FAILED'):
-                    operationIdglobal = operation_db.get_operationId(nsId, "INSTANTIATION")
-                    operation_db.set_operation_status(operationIdglobal, "FAILED")
-                    # set ns status as FAILED
-                    ns_db.set_ns_status(nsId, "FAILED")
-                    return #stop instantiating: to do: to manage in case of failure
-                time.sleep(10)   
-            log_queue.put(["INFO", "SOEp COMPLETE scaling operationId: %s" % (operationId)])
-            sap_info =  get_sap_info_provider(nsId_n, conn) # we close here the connection   
-            #update the register in the nested
-            ns["nested_il"] = target_il
-            ns_db.update_nested_service_info(nsId, ns, "set", nested_id)
-            #update the register in the global registry
-            ns_db.set_ns_il(nsId, target_il)
+    # We treat here the following cases defined in scale_ns
+    # 1.5) considering that this single NS it is being used by a composite
+    # 2) scaling of a single delegated NS 
+    #    2.5) autoscaling of a single delegated NS
+    # 3) scaling of a composite NS 
+    #    3.5) scaling of a composite with federated components 
+    # 4) autoscaling of a nested NS local 
+    #    4.5) autoscaling of nested NS federated -> need to drive connections
 
-    # after instantiating all the nested services, update info of the instantiation    
-    operationId = operation_db.get_operationId(nsId, "INSTANTIATION")
-    ns_record = ns_db.get_ns_record(nsId)
+    # in the case we have composite_nsIds, we have to wait for the scaling of the nestedNs, 
+    # prior to update the connections with the components associated compositeNs
+    target_il = body.scale_ns_data.scale_ns_to_level_data.ns_instantiation_level
+    # local_services, federated_services, nested_ns_instance are variables populated when needed
+    local_services = []
+    federated_services = []
+    nested_ns_instance = {}
+    local_il_nested = []
+    federated_il_nested = []
+    reference_il = []
+    if (composite_nsIds):
+        # Case 1.5) considering that this single NS it is being used by a composite
+        # we consider that resulting dfs will be compatible, nevertheless, for the sake
+        # of compatibility, we check after the scaling of the single NS
+        status = ns_db.get_ns_status(nsId)
+        # nested_ns_instance[ns_db.get_nsdId(nsId)] = nsId --> it is determined afterwards
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp checking the scaling of a reference to update associated composites: case 1.5)" % (nsId)])
+        while (status != "INSTANTIATED"):
+            status = ns_db.get_ns_status(nsId)
+            log_queue.put(["DEBUG", "Scaling a reference"])
+            if (status == "FAILED"):
+                # we return without doing nothing
+                return
+            if (status == "INSTANTIATED"):
+                break
+            time.sleep(10)
+        # now that, the reference has been scaled, we pass to the list of composites
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp reference scaling finished: case 1.5)" % (nsId)])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp updating associated composite NSs: case 1.5)" % (nsId)])
+        for composite_ns in range(0, len(composite_nsIds)):
+            log_queue.put(["INFO", "*****Time measure for composite nsId: %s: SOEp SOEp updating composite NSs %s"%(composite_ns, composite_ns)])
+            nsId_compo_tmp = composite_nsIds[composite_ns]
+            log_queue.put(["DEBUG", "The composite NS to be updated after a reference is scaling: %s"%nsId_compo_tmp])
+            ns_info = ns_db.get_ns_record(nsId_compo_tmp)
+            ns_db.set_ns_status(nsId_compo_tmp, "SCALING")
+            log_queue.put(["DEBUG", "Composite current_il: %s"%ns_db.get_ns_il(nsId_compo_tmp)])
+            [target_il, local_il_nested, federated_il_nested, reference_il, local_services, federated_services, nested_ns_instance] = \
+            determine_new_il_composite_scaling(body, ns_info, nsId)
+            # log_queue.put(["DEBUG", "Composite target_il: %s"%target_il])
+            # log_queue.put(["DEBUG", "local_il_nested: "])
+            # log_queue.put(["DEBUG", dumps(local_il_nested)])
+            # log_queue.put(["DEBUG", "federated_il_nested: "])
+            # log_queue.put(["DEBUG", dumps(federated_il_nested)])
+            # log_queue.put(["DEBUG", "reference_il:"])
+            # log_queue.put(["DEBUG", dumps(reference_il)])
+            # log_queue.put(["DEBUG", "local_services:"])
+            # log_queue.put(["DEBUG", dumps(local_services)])
+            # log_queue.put(["DEBUG", "federated_services:"])
+            # log_queue.put(["DEBUG", dumps(federated_services)])
+            # log_queue.put(["DEBUG", "nested_ns_instance:"])
+            # log_queue.put(["DEBUG", dumps(nested_ns_instance)])
+            # we have waited until the reference has been scaled, then the crooe has to update the connections for each composite and update the status
+            # update connections with the help of crooe
+            # first local nested connections
+            nsdId_compo = ns_db.get_nsdId(nsId_compo_tmp)
+            nsd_json_compo = nsd_db.get_nsd_json(nsdId_compo, None)
+            log_queue.put(["INFO", "*****Time measure: SOEp SOEp determine new_il_composite_scaling composite NSs %s"%composite_ns])
+            if ((len(local_il_nested) > 0 and len(local_services)>1) or (len(local_services) > 0 and len(reference_il) > 0)): 
+                # the first part of the condition is not needed 
+                # here we still consider that the reference is always a local service
+                log_queue.put(["INFO", "*****Time measure for composite nsId: %s: SOEp SOEp-CROOE scaling updating local nested NSs interconnections WITH REFERENCE" %(composite_ns)])
+                crooe.update_connecting_nested_local_services(nsId_compo_tmp, nsd_json_compo, local_services, nested_ns_instance)
+                log_queue.put(["INFO", "*****Time measure for composite nsId: %s: SOEp SOEp-CROOE scaling finishing updating local nested NSs interconnections WITH REFERENCE" %(composite_ns)])
+            if (len(federated_services)>0 and (len(federated_il_nested)>0 or len(local_il_nested)>0 or len(reference_il) > 0)):
+                log_queue.put(["INFO", "*****Time measure for composite nsId: %s: SOEp SOEp-CROOE scaling updated federated nested NSs interconnections WITH REFERENCE" %(composite_ns)])
+                crooe.update_connecting_nested_federated_local_services(nsId_compo_tmp, nsd_json_compo, nested_ns_instance)
+                log_queue.put(["INFO", "*****Time measure for composite nsId: %s: SOEp SOEp-CROOE scaling finishing updated federated nested NSs interconnections WITH REFERENCE" %(composite_ns)])      
+
+            # after updating the connections, update info of the instantiation at the composite level    
+            status = "INSTANTIATED"
+            for elem in ns_info["nested_service_info"]:
+                 if not elem["status"] == "INSTANTIATED":
+                     status = "INSTANTIATING"
+                     break
+            if (status == "INSTANTIATED"):
+               log_queue.put(["DEBUG", "NS Scaling in the ASSOCIATED COMPOSITE finished correctly"])
+               # set the new instantiation level
+               ns_db.set_ns_il(nsId_compo_tmp, target_il)
+               # set ns status as INSTANTIATED, although it is already
+               ns_db.set_ns_status(nsId_compo_tmp, "INSTANTIATED")
+        log_queue.put(["DEBUG", "Associated Composite NSs Scaling finished correctly"])
+        operationId = operation_db.get_operationId(nsId, "INSTANTIATION")           
+        operation_db.set_operation_status(operationId, "SUCCESSFULLY_DONE")
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp Associated Composite NSs scaling finished correctly" % (nsId)])
+        return
+    else:
+        # no composite_nsIds to be udpated
+        nsdId = ns_db.get_nsdId(nsId)
+        if (nsdId == None):
+            # case 2.5) autoscaling of a delegated NS 
+            # case 4) autoscaling of a nested NS local
+            # it means that we are autoscaling a nested NS, we need to call soe for scaling
+            # we have modified the SLA module to make the scaling call using the nested_instance_id
+            #     case 4.5) autoscaling of a nested NS federated 
+            #     in theory, we only need to update connections -> done by consumer domain
+            # assuming compatibility in the dfs
+            nsId_tmp = nsId.split('_') 
+            if (len(nsId_tmp) == 1):
+                log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp handling autoscaling delegated" % (nsId)])
+                # autoscaling of a delegated, the consumer domain needs to update the info
+                # case 2.5) autoscaling of a delegated NS 
+                nsId_consumer = ns_db.get_consumer_owner_delegated(nsId)
+                delegated_nested_info =ns_db.get_particular_nested_service_info(nsId_consumer, nsId) 
+                delegated_nested_info["status"] = "SCALING"
+                ns_db.update_nested_service_info(nsId_consumer, delegated_nested_info, "set", nsId)
+                domain = delegated_nested_info["domain"]
+                opId = None
+                for key in body.scale_ns_data.additional_param_for_ns.keys(): 
+                    if (key == "operationId"):
+                        opId = body.scale_ns_data.additional_param_for_ns[key]
+                if (opId):
+                    key = next(iter(domain))
+                    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp waiting autoscaling delegated" % (nsId)])
+                    status = get_operation_status_provider(opId, None, domain[key])
+                    while (status != "SUCCESSFULLY_DONE"):
+                        if (status == 'FAILED'):
+                            operationIdglobal = operation_db.get_operationId(nsId_consumer, "INSTANTIATION")
+                            operation_db.set_operation_status(operationIdglobal, "FAILED")
+                            ns_db.set_ns_status(nsId_consumer, "FAILED")
+                            return #stop scaling: to do: to manage in case of failure
+                        time.sleep(10)
+                        status = get_operation_status_provider(opId, None, domain[key])
+                    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp autoscaling delegated finished scaling" % (nsId)])
+                    log_queue.put(["INFO", "Provider domain finished scaling operationId: %s" % (opId)])
+                    sap_info = get_sap_info_provider(nsId, None, domain)
+                    delegated_nested_info["nested_il"] = body.scale_ns_data.scale_ns_to_level_data.ns_instantiation_level
+                    delegated_nested_info["status"] = "INSTANTIATED"
+                    ns_db.update_nested_service_info(nsId_consumer, delegated_nested_info, "set", nsId)  
+                    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp autoscaling delegated updated databases" %(nsId)])
+                    return                           
+            else:
+                # autoscaling of a nested NS, either local or federated   
+                # case 4) and 4.5)     
+                if ns_db.get_nsdId(nsId_tmp[0]):
+                    # we are auto-scaling a local, because the entry exists in the db, we have to ask the soe to make the actual scaling
+                    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp autoscaling nested NS local" % (nsId_tmp[0])])
+                    log_queue.put(["DEBUG", "Autoscaling of a nested NS local"])
+                    nsdId = ns_db.get_nsdId(nsId_tmp[0])
+                    nsd_json = nsd_db.get_nsd_json(nsdId, None)
+                    # we need to build the local_il_nested variables, .... to then udpate the connections
+                    ns_info = ns_db.get_ns_record(nsId_tmp[0])
+                    # target_il of the composite
+                    log_queue.put(["DEBUG", "Composite current_il: %s"%ns_db.get_ns_il(nsId_tmp[0])])
+                    [target_il, local_il_nested, federated_il_nested, reference_il, local_services, federated_services, nested_ns_instance] = \
+                    determine_new_il_composite_scaling(body, ns_info, nsId)
+                    # log_queue.put(["DEBUG", "Composite target_il: %s"%target_il])
+                    # log_queue.put(["DEBUG", "local_il_nested: "])
+                    # log_queue.put(["DEBUG", dumps(local_il_nested)])
+                    # log_queue.put(["DEBUG", "federated_il_nested: "])
+                    # log_queue.put(["DEBUG", dumps(federated_il_nested)])
+                    # log_queue.put(["DEBUG", "reference_il:"])
+                    # log_queue.put(["DEBUG", dumps(reference_il)])
+                    # log_queue.put(["DEBUG", "local_services:"])
+                    # log_queue.put(["DEBUG", dumps(local_services)])
+                    # log_queue.put(["DEBUG", "federated_services:"])
+                    # log_queue.put(["DEBUG", dumps(federated_services)])
+                    # log_queue.put(["DEBUG", "nested_ns_instance:"])
+                    # log_queue.put(["DEBUG", dumps(nested_ns_instance)])
+                    # log_queue.put(["INFO", "*****Time measure: SOEp SOEp autoscaling nested NS local determined new_il_composite_scaling"])
+                    if (target_il == None and local_il_nested == None and federated_il_nested == None and reference_il == None):
+                        # it means that we are trying to modify a reference, which we do not allow
+                        return 404
+                    nested_info = ns_db.get_particular_nested_service_info(nsId_tmp[0], nsId)
+                    nested_info["status"] = "SCALING"
+                    ns_db.update_nested_service_info(nsId_tmp[0], nested_info, "set", nsId_tmp[1])
+                    if ("nested_monitoring_jobs" in nested_info):
+                        ns_db.set_monitoring_info(nsId_tmp[0], nested_info["nested_monitoring_jobs"])
+                        if ("nested_alert_jobs" in nested_info):
+                            ns_db.set_alert_info(nsId_tmp[0], nested_info["nested_alert_jobs"])
+                    # create the same nested variable that for case 3) scaling of a composite NS
+                    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp autoscaling nested NS local relying SOEc" % (nsId_tmp[0])])
+                    soe.scale_ns_process(nsId_tmp[0], body, local_il_nested[0])
+                    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp autoscaling nested NS local relying SOEc: scale done" % (nsId_tmp[0])])
+                    # update the variables after the service is scaled
+                    sapInfo = generate_nested_sap_info(nsId_tmp[0], next(iter(local_il_nested[0])))
+                    if (sapInfo == None): 
+                        # there has been a problem with the nested service and the process failed, we have 
+                        # to abort the scaling operation
+                        operationId = operation_db.get_operationId(nsId_tmp[0], "INSTANTIATION")
+                        operation_db.set_operation_status(operationId, "FAILED")
+                        # set ns status as FAILED
+                        ns_db.set_ns_status(nsId_tmp[0], "FAILED")
+                        # remove the reference previously set
+                        if ns_db.get_ns_nested_services_ids(nsId_tmp[0]):
+                              ns_db.delete_ns_shared_services_ids(ns_db.get_ns_nested_services_ids(nsId_tmp[0]), nsId_tmp[0])
+                        return #stop scaling: to do: to manage in case of failure
+                    # now, after scaling, we update the monitoring/alert information 
+                    nested_monitoring_jobs = ns_db.get_monitoring_info(nsId_tmp[0])
+                    if (len(nested_monitoring_jobs)>0):
+                        # it means that there is monitoring jobs
+                        info['nested_monitoring_jobs'] = nested_monitoring_jobs
+                        # it is not needed to update the alerts!!!
+                        # now, we can set to void the monitoring entry
+                        ns_db.set_monitoring_info(nsId_tmp[0],[])
+                    #it means the scaling operation finished correctly, so we can update the register
+                    nested_info["status"] = "INSTANTIATED"
+                    nested_info["sapInfo"] = sapInfo
+                    nested_info["nested_il"] = body.scale_ns_data.scale_ns_to_level_data.ns_instantiation_level
+                    ns_db.update_nested_service_info(nsId_tmp[0], nested_info, "set", nsId)
+                    ns_db.save_sap_info(nsId_tmp[0], "")
+                    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp autoscaling nested NS local updated DBs" % (nsId_tmp[0])])
+                else:
+                    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp autoscaling nested NS FEDERATED" % (nsId_tmp[1])])
+                    log_queue.put(["DEBUG", "Autoscaling of a nested NS in provider domain"])
+                    log_queue.put(["DEBUG", "waiting for a provider nested NS to finish the scaling"])
+                    # we are in the case of auto-scaling a federated, so we have to ask for information to update the pairs
+                    # we have to implement the waiting procedure before updating the connections, because it is scaling in the provider domain still
+                    # the provider sends a scaling request to the consumer with nsIdprovider_nsIdconsumer(composite), 
+                    # and in additional params the operationId to query state
+                    # we need to build the local_il_nested variables, .... to then udpate the connections
+                    ns_info = ns_db.get_ns_record(nsId_tmp[1])
+                    log_queue.put(["DEBUG", "Composite current_il: %s"%ns_db.get_ns_il(nsId_tmp[1])])
+                    [target_il, local_il_nested, federated_il_nested, reference_il, local_services, federated_services, nested_ns_instance] = \
+                    determine_new_il_composite_scaling(body, ns_info, nsId_tmp[0])
+                    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp autoscaling nested NS FEDERATED determined new_il_composite_scaling" % (nsId_tmp[1])])
+                    nsdId = ns_db.get_nsdId(nsId_tmp[1])
+                    nsd_json = nsd_db.get_nsd_json(nsdId, None)
+                    if (target_il == None and local_il_nested == None and federated_il_nested == None and reference_il == None):
+                        # it means that we are trying to modify a reference, which we do not allow
+                        return 404
+                    nested_info = ns_db.get_particular_nested_service_info(nsId_tmp[1], nsId_tmp[0])
+                    nested_info["status"] = "SCALING"
+                    ns_db.update_nested_service_info(nsId_tmp[1], nested_info, "set", nsId_tmp[0])
+                    domain = nested_info["domain"]
+                    opId = None
+                    for key in body.scale_ns_data.additional_param_for_ns.keys(): 
+                        if (key == "operationId"):
+                            opId = body.scale_ns_data.additional_param_for_ns[key]
+                    if (opId):
+                        log_queue.put(["DEBUG", "The operationId in the provider domain is: %s"%opId])
+                        key = next(iter(domain))
+                        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp waiting autoscaling nested NS FEDERATED" % (nsId_tmp[1])])
+                        status = get_operation_status_provider(opId, None, domain[key])
+                        while (status != "SUCCESSFULLY_DONE"):
+                            if (status == 'FAILED'):
+                                operationIdglobal = operation_db.get_operationIdcomplete(nsId_tmp[1], "INSTANTIATION", "PROCESSING")
+                                operation_db.set_operation_status(operationIdglobal, "FAILED")
+                                ns_db.set_ns_status(nsId_tmp[1], "FAILED")
+                                return #stop scaling: to do: to manage in case of failure
+                            time.sleep(10)
+                            status = get_operation_status_provider(opId, None, domain[key])
+                        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp autoscaling nested NS FEDERATED finished" % (nsId_tmp[1])])
+                        log_queue.put(["INFO", "Provider domain finished scaling operationId: %s" % (opId)])
+                        federated_info = crooe.get_federated_network_instance_info_request(nsId_tmp[0], nested_info["nested_id"], domain[key], ewbi_port, ewbi_path)
+                        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp autoscaling nested NS FEDERATED obtain crooe info" % (nsId_tmp[1])])
+                        log_queue.put(["INFO", "SOEp obtained federatedInfo after SCALING through EWBI: %s"%federated_info])
+                        sap_info = get_sap_info_provider(nsId_tmp[0], None, domain[key])
+                        nested_info["federatedInstanceInfo"] = federated_info
+                        nested_info["sapInfo"] = sap_info
+                        nested_info["nested_il"] = body.scale_ns_data.scale_ns_to_level_data.ns_instantiation_level
+                        nested_info["status"] = "INSTANTIATED"
+                        ns_db.update_nested_service_info(nsId_tmp[1], nested_info, "set", nsId_tmp[0]) 
+                        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp autoscaling nested NS FEDERATED update DBs" % (nsId_tmp[1])])                        
+        else:
+            nsd_json = nsd_db.get_nsd_json(nsdId, None)
+            ns_info = ns_db.get_ns_record(nsId)
+            #nested_service_info = ns_db.get_nested_service_info(nsId)
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp scaling a composite NS" % (nsId)])
+            log_queue.put(["DEBUG", "SOEp case 3) scaling a compositeNS"])
+            log_queue.put(["DEBUG", "SOEp case 3) ns_info: %s"% ns_info])
+            if "nestedNsdId" in nsd_json["nsd"].keys():
+                # case 3) scaling of a composite NS 
+                # this means that we are dealing with a composite NS
+                # we get target_il and check which are the nesteds that need to scale -> crooe 
+                [local_il_nested, federated_il_nested, reference_il, local_services, federated_services, nested_ns_instance] = \
+                check_new_df_compatibilities_scaling(body, ns_info)
+                if (local_il_nested == None and federated_il_nested == None and reference_il == None):
+                    # it means that we are trying to modify a reference, which we do not allow
+                    log_queue.put(["DEBUG", "Not allowed operation, trying to modify a reference, we do not continue"])
+                    log_queue.put(["DEBUG", "NS Scaling finished without changes"])
+                    operationId = operation_db.get_operationIdcomplete(nsId, "INSTANTIATION", "PROCESSING")
+                    operation_db.set_operation_status(operationId, "CANCELLED")
+                    # set ns status as INSTANTIATED
+                    ns_db.set_ns_status(nsId, "INSTANTIATED")
+                    return 404
+                # if yes, we iterate over the set of them
+                # log_queue.put(["DEBUG", "Scaling COMPOSITE local_il_nested: "])
+                # log_queue.put(["DEBUG", dumps(local_il_nested, indent=4)])
+                # log_queue.put(["DEBUG", "Scaling COMPOSITE federated_il_nested: "])
+                # log_queue.put(["DEBUG", dumps(federated_il_nested, indent=4)])
+                # log_queue.put(["DEBUG", "Scaling COMPOSITE reference_il:"])
+                # log_queue.put(["DEBUG", dumps(reference_il, indent=4)])
+                # log_queue.put(["INFO", "*****Time measure: SOEp SOEp scaling a composite NS determining df_compatibilties scaling"])
+                for nested in local_il_nested:
+                    # we need to define the new body with the target_il 
+                    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp scaling a composite NS, iterating over local nested" % (nsId)])
+                    nested_body = define_new_body_scaling_for_composite(nested, body)
+                    log_queue.put(["DEBUG", "nested_body: %s"% nested_body])
+                    # nsId_nested = nsId + '_' + next(iter(nested))
+                    nsId_nested = nested[next(iter(nested))][4]
+                    nested_info = ns_db.get_particular_nested_service_info(nsId, nsId_nested)
+                    nested_info["status"] = "SCALING"
+                    ns_db.update_nested_service_info(nsId, nested_info, "set", nsId_nested)
+                    # prior to scale the service, we need to recover the sap info information of the nested so it can be updated
+                    # sap_info_tmp = nested_info["sapInfo"]
+                    # sap_info = transform_nested_sap_info(sap_info_tmp)
+                    # log_queue.put(["DEBUG", "transformed sap_info: %s" % dumps(sap_info,indent=4)])
+                    # ns_db.save_sap_info(nsId, sap_info)
+                    # prior to scale the service, we need to recover the monitoring/alert information so it can be updated
+                    if ("nested_monitoring_jobs" in nested_info):
+                        ns_db.set_monitoring_info(nsId, nested_info["nested_monitoring_jobs"])
+                        if ("nested_alert_jobs" in nested_info):
+                            ns_db.set_alert_info(nsId, nested_info["nested_alert_jobs"])
+                    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp scaling a composite NS, relying on SOEc" % (nsId)])
+                    soe.scale_ns_process(nsId, nested_body, nested)
+                    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp scaling a composite NS, scaling finished at SOEc" % (nsId)])
+                    # the service is scaled
+                    sapInfo = generate_nested_sap_info(nsId, next(iter(nested)))
+                    if (sapInfo == None): 
+                        # there has been a problem with the nested service and the process failed, we have 
+                        # to abort the scaling operation
+                        operationId = operation_db.get_operationId(nsId, "INSTANTIATION")
+                        operation_db.set_operation_status(operationId, "FAILED")
+                        # set ns status as FAILED
+                        ns_db.set_ns_status(nsId, "FAILED")
+                        # remove the reference previously set
+                        if ns_db.get_ns_nested_services_ids(nsId):
+                              ns_db.delete_ns_shared_services_ids(ns_db.get_ns_nested_services_ids(nsId), nsId)
+                        return #stop scaling: to do: to manage in case of failure
+                    # now, after scaling, we update the monitoring/alert information 
+                    nested_monitoring_jobs = ns_db.get_monitoring_info(nsId)
+                    if (len(nested_monitoring_jobs)>0):
+                        # it means that there is monitoring jobs
+                        nested_info['nested_monitoring_jobs'] = nested_monitoring_jobs
+                        # it is not needed to update the alerts!!!
+                        # now, we can set to void the monitoring entry
+                        ns_db.set_monitoring_info(nsId,[])
+                    #it means the scaling operation finished correctly, so we can update the register
+                    nested_info["status"] = "INSTANTIATED"
+                    nested_info["sapInfo"] = sapInfo
+                    nested_info["nested_il"] = nested[next(iter(nested))][2]
+                    ns_db.update_nested_service_info(nsId, nested_info, "set", nsId_nested)
+                    ns_db.save_sap_info(nsId, "")
+                    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp scaling a composite NS, updating DBs" % (nsId)])
+                for nested in federated_il_nested:
+                    # case 3.5) scaling a service with federated parts
+                    log_queue.put(["INFO", "*****Time measure: SOEp SOEp scaling a composite NS, iterating over federated nested"])
+                    nested_body = define_new_body_scaling_for_composite(nested, body)
+                    nsId_nested = nested[next(iter(nested))][4]
+                    domain = nested[next(iter(nested))][3]
+                    nested_info = ns_db.get_particular_nested_service_info(nsId, nsId_nested)
+                    # log_queue.put(["In SOEp SCALING FEDERATED, nested_body: %s"%nested_body])
+                    # log_queue.put(["In SOEp SCALING FEDERATED, nsId_nested: %s"%nsId_nested])
+                    # log_queue.put(["In SOEp SCALING FEDERATED, domain: %s"%domain])
+                    # log_queue.put(["In SOEp SCALING FEDERATED, nested_info: %s"%nested_info])                 
+                    # domain = ns["domain"]
+                    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp scaling a composite NS, scaling federated nested" % (nsId)])
+                    scale_federated_service(nsId, nested_info, nsId_nested, nested_body, domain)
+                    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp scaling a composite NS, scaled federated nested" % (nsId)])
+                # then, we need to update the internestedlinks -> either add, either remove (jump to #update connections with the help of croe)      
+            else:
+                # 2) scaling of a single delegated NS
+                # this means that we are dealing with a delegated NS, and we do not need to update connections,
+                # so after the scaling, we return
+                log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp handling scaling delegated" % (nsId)])
+                ns = ns_info['nested_service_info'][0]   
+                nested_id_instance = ns["nested_instance_id"]
+                domain = ns["domain"]
+                target_il = scale_federated_service(nsId, ns, nested_id_instance, body, domain)
+                log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp handling scaling delegated, delegated scaled"% (nsId)])
+                #update the register in the global registry
+                operationId = operation_db.get_operationIdcomplete(nsId, "INSTANTIATION", "PROCESSING")
+                ns_record = ns_db.get_ns_record(nsId)
+                status = "INSTANTIATED"
+                for elem in ns_record["nested_service_info"]:
+                    if not elem["status"] == "INSTANTIATED":
+                        status = "INSTANTIATING"
+                        break
+                if (status == "INSTANTIATED"):
+                    log_queue.put(["DEBUG", "NS Scaling finished correctly"])
+                    operation_db.set_operation_status(operationId, "SUCCESSFULLY_DONE")
+                    # set the new instantiation level
+                    ns_db.set_ns_il(nsId, target_il)
+                    # set ns status as INSTANTIATED
+                    ns_db.set_ns_status(nsId, "INSTANTIATED")
+                    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp handling scaling delegated, updated DBs"% (nsId)])
+                    return
+
+    # update connections with the help of crooe
+    # first local nested connections
+    # we need again to evaluate the case we are, so we provide the correct nsId identifier. 
+    # We will enter here for cases 3) and 4) and its subcases
+    # the other variables, have been previously created
+    log_queue.put(["INFO", "*****Time measure: SOEp SOEp start updating connections (multiple cases)"])
+    connection_step_nsdId = ns_db.get_nsdId(nsId)
+    if (connection_step_nsdId == None):
+        #this means that a nested is autoscaling
+        connection_step_nsId_tmp = nsId.split('_')
+        if (len(connection_step_nsId_tmp) > 1):
+            # the scale request refers to a scaling of a nested service
+            if ns_db.get_nsdId(connection_step_nsId_tmp[0]):
+                # auto-scaling of a consumer nested service
+                connection_nsId = connection_step_nsId_tmp[0]
+            else:
+                # auto-scaling of a provider nested service
+                connection_nsId = connection_step_nsId_tmp[1]
+    else:
+        # if existing, then the scale request refers to a composite request
+        connection_nsId = nsId
+
+    if ((len(local_il_nested) > 0 and len(local_services)>1) or (len(local_services) >0 and len(reference_il) > 0)):  
+        # here we still consider that the reference is always a local service
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp-CROOE scaling updating local nested NSs interconnections" % (connection_nsId)])
+        crooe.update_connecting_nested_local_services(connection_nsId, nsd_json, local_services, nested_ns_instance)
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp-CROOE scaling finishing updating local nested NSs interconnections" % (connection_nsId)])
+    if (len(federated_services)>0 and (len(federated_il_nested)>0 or len(local_il_nested)>0 or len(reference_il) > 0)):
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp-CROOE scaling updated federated nested NSs interconnections" % (connection_nsId)])
+        crooe.update_connecting_nested_federated_local_services(connection_nsId, nsd_json, nested_ns_instance)
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp-CROOE scaling finishing updated federated nested NSs interconnections" % (connection_nsId)])      
+
+    # after scaling all the nested services, update info of the instantiation at the composite level    
+    #operationId = operation_db.get_operationId(connection_nsId, "INSTANTIATION")
+    operationId = operation_db.get_operationIdcomplete(connection_nsId, "INSTANTIATION", "PROCESSING")
+    log_queue.put(["DEBUG", "Final step validating OperationID and updating DBs"])
+    ns_record = ns_db.get_ns_record(connection_nsId)
     status = "INSTANTIATED"
     for elem in ns_record["nested_service_info"]:
         if not elem["status"] == "INSTANTIATED":
             status = "INSTANTIATING"
             break
     if (status == "INSTANTIATED"):
-        log_queue.put(["DEBUG", "NS Instantiation finished correctly"])
+        log_queue.put(["DEBUG", "NS Scaling finished correctly"])
         operation_db.set_operation_status(operationId, "SUCCESSFULLY_DONE")
+        # set the new instantiation level
+        ns_db.set_ns_il(connection_nsId, target_il)
         # set ns status as INSTANTIATED
-        ns_db.set_ns_status(nsId, "INSTANTIATED")
+        ns_db.set_ns_status(connection_nsId, "INSTANTIATED")
+    notification_db.create_notification_record({
+        "nsId": nsId,
+        "type": "fa-gears",
+        "text": nsId + " SCALED",
+        "time": datetime.now().strftime("%d/%m/%Y %H:%M:%S.%f")
+      })
 
 
 def terminate_ns_process(nsId, aux):
@@ -605,7 +1419,7 @@ def terminate_ns_process(nsId, aux):
     name: type
         return description
     """
-    log_queue.put(["INFO", "*****Time measure: SOEp SOEp starting terminating service"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp starting terminating service" % (nsId)])
     log_queue.put(["DEBUG", "SOEp terminating_ns_process with nsId %s" % (nsId)])
     ns_db.set_ns_status(nsId, "TERMINATING")
     nested_record = ns_db.get_ns_record(nsId)
@@ -613,18 +1427,20 @@ def terminate_ns_process(nsId, aux):
     # we have to remove in reverse order of creation (list are ordered in python)
     #for index in range(0, len(nested_info)):
     for index in range(len(nested_info)-1, -1, -1):
-        log_queue.put(["INFO", "*****Time measure: SOEp SOEp terminating nested service"])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp terminating nested service index %s" % (nsId, index)])
         nested_service = nested_info[index]
         if (nested_service["domain"] == "local"):
             # local service to be terminated
             nested_service["status"] = "TERMINATING"
-            log_queue.put(["INFO", "SOEp eliminating LOCAL nested service: %s"%nested_service["nested_instance_id"]])
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp terminating LOCAL nested service: %s"% (nsId, nested_service["nested_instance_id"])])
             soe.terminate_ns_process(nested_service["nested_instance_id"], None)
             # update the status
             nested_service["status"] = "TERMINATED"
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp terminated LOCAL nested service: %s"% (nsId, nested_service["nested_instance_id"])])
+
         else:
             # federated service to be terminated
-            log_queue.put(["INFO", "SOEp eliminating FEDERATED nested service: %s"%nested_service["nested_instance_id"]])
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp terminating FEDERATED nested service: %s"% (nsId,nested_service["nested_instance_id"])])
             [operationId, conn] = terminate_ns_provider(nested_service["nested_instance_id"], nested_service["domain"])
             nested_service["status"] = "TERMINATING"
             status = "TERMINATING"
@@ -639,11 +1455,19 @@ def terminate_ns_process(nsId, aux):
                 time.sleep(10)
             # update the status
             nested_service["status"] = "TERMINATED"
-    log_queue.put(["INFO", "*****Time measure: SOEp SOEp finished ALL nested service"])
+            notification_db.create_notification_record({
+                "nsId": nested_service["nested_instance_id"],
+                "type": "fa-trash-o",
+                "text": nested_service["nested_instance_id"] + " TERMINATED in FEDERATED domain" + nested_service["domain"],
+                "time": datetime.now().strftime("%d/%m/%Y %H:%M:%S.%f")
+              })
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp terminated FEDERATED nested service: %s"% (nsId,nested_service["nested_instance_id"])])
+
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp terminated ALL nested service" % (nsId)])
     #croe remove the local logical links for this composite service (to be reviewed when federation)
-    log_queue.put(["INFO", "*****Time measure: SOEp SOEp starting removing nested connections"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp starting removing nested connections" % (nsId)])
     crooe.remove_nested_connections(nsId)
-    log_queue.put(["INFO", "*****Time measure: SOEp SOEp finishing removing nested connections"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp finishing removing nested connections" % (nsId)])
 
     #now declare the composite service as terminated
     operationId = operation_db.get_operationId(nsId, "TERMINATION")
@@ -663,7 +1487,14 @@ def terminate_ns_process(nsId, aux):
             ns_db.delete_ns_shared_services_ids(nested_instanceId, nsId)
         # for the 5Gr-VS not to break
         # ns_db.delete_ns_record(nsId)
-    log_queue.put(["INFO", "*****Time measure: SOEp SOEp finished terminating service"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp finished terminating service" % (nsId)])
+    notification_db.create_notification_record({
+        "nsId": nsId,
+        "type": "fa-trash-o",
+        "text": nsId + " TERMINATED",
+        "time": datetime.now().strftime("%d/%m/%Y %H:%M:%S.%f")
+      })
+
 
 ########################################################################################################################
 # PUBLIC METHODS                                                                                                       #
@@ -720,7 +1551,7 @@ def instantiate_ns(nsId, body, requester):
     string
         Id of the operation associated to the Network Service instantiation.
     """
-    log_queue.put(["INFO", "*****Time measure: SOEp SOEp instantiating a NS"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp instantiating a NS" % (nsId)])
     log_queue.put(["INFO", "instantiate_ns for nsId %s with body: %s" % (nsId, body)])
     #client = MongoClient()
     #fgtso_db = client.fgtso
@@ -803,7 +1634,7 @@ def instantiate_ns(nsId, body, requester):
     return operationId
 
 
-def scale_ns(nsId, body):
+def scale_ns(nsId, body, requester):
     """
     Starts a process to scale the Network Service associated with the instance identified by "nsId".
     Parameters
@@ -811,46 +1642,165 @@ def scale_ns(nsId, body):
     nsId: string
         Identifier of the Network Service Instance.
     body: request body
+    requester: string
+        IP address of the entity making the request
     Returns
     -------
     string
         Id of the operation associated to the Network Service instantiation.
     """
-
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp scaling a NS" % (nsId)])
     log_queue.put(["INFO", "scale_ns for nsId %s with body: %s" % (nsId, body)])
 
-    if not ns_db.exists_nsId(nsId):
+    # if not ns_db.exists_nsId(nsId):
+    #     return 404
+
+    # status = ns_db.get_ns_status(nsId)
+    # if status != "INSTANTIATED":
+    #     return 400
+
+    # !!!!!the following line commented for the test case (ns_db, operationId)
+    if (len(nsId.split('_')) > 1):
+        # here we are in front of two cases: auto-scaling of a local nested
+        # or autoscaled of a federated
+        nsId_tmp = nsId.split('_')
+        if ns_db.exists_nsId(nsId_tmp[0]):
+            status = ns_db.get_ns_status(nsId_tmp[0])
+            nsId_tmp2 = nsId_tmp[0]
+            log_queue.put(["DEBUG", "Scaling a nested NS requested by consumer"])
+        elif ns_db.exists_nsId(nsId_tmp[1]):
+            status = ns_db.get_ns_status(nsId_tmp[1])
+            nsId_tmp2 = nsId_tmp[1]
+            log_queue.put(["DEBUG", "Scaling a nested NS requested by provider"])
+        else:
+            log_queue.put(["DEBUG", "Scale request with wrong nsId"])
+            # if neither of those exists, you cannot scale, bad nsId
+            return 404
+        if status != "INSTANTIATED":
+            return 400
+        ns_db.set_ns_status(nsId_tmp2, "SCALING")
+        operationId = create_operation_identifier(nsId_tmp2, "INSTANTIATION")
+        log_queue.put(["DEBUG", "El operation ID START para BIG lengths es: %s y nsId: %s"%(operationId,nsId_tmp2)])        
+    else:
+        ns_db.set_ns_status(nsId, "SCALING")
+        operationId = create_operation_identifier(nsId, "INSTANTIATION")
+        log_queue.put(["DEBUG", "El operation ID START es: %s y nsId: %s"%(operationId,nsId)])
+    # considered cases for scaling:  
+    # 1) local scaling of single NS
+    #    1.5) considering that this single NS it is being used by a composite
+    # 2) scaling of a single delegated NS 
+    #    2.5) auto-scaling of a single delegated NS
+    # 3) scaling of a composite NS 
+    #    3.5) scaling of a composite with federated components 
+    # 4) autoscaling of a nested NS local 
+    #    4.5) autoscaling of nested NS federated -> need to drive connections
+    # get the nsdId that corresponds to nsId
+    validIP = False
+    request_origin = "local"
+    log_queue.put(["DEBUG", "SOEp receiving SCALING request from: %s"%(requester)])
+    # check where the request comes from, either local or from a federated domain
+    if requester not in available_VS:
+        #it comes from a federated domain
+        request_origin = requester
+        # now, check if it is a validIP, from a registered federated domain
+        for domain in fed_domain.keys():
+            if (fed_domain[domain] == requester):
+                validIP = True
+                log_queue.put(["INFO", "SOEp receiving SCALING request from a valid federated domain: %s = (%s)"%(domain,fed_domain[domain])])
+    else:
+        log_queue.put(["INFO", "SOEp receiving SCALING request from a valid local domain"])
+        validIP = True
+        
+    if not validIP:
+        # the request comes from a non-authorised origin, discard the request
+        log_queue.put(["INFO", "SOEp receiving SCALING request from a non-valid requester"])
         return 404
 
-    status = ns_db.get_ns_status(nsId)
-    if status != "INSTANTIATED":
-        return 400
-    ns_db.set_ns_status(nsId, "SCALING")
-    operationId = create_operation_identifier(nsId, "INSTANTIATION")
-    # for the moment, we only consider two cases for scaling:  
-    # 1) local scaling and 2) scaling of a single delegated NS
-    # get the nsdId that corresponds to nsId
     nsdId = ns_db.get_nsdId(nsId)
-    nsd_json = nsd_db.get_nsd_json(nsdId, None)
-    domain = nsd_db.get_nsd_domain (nsdId)
+    nsId_tmp = None
+    if nsdId is None:
+        # it means it is auto-scaling of a nested NS local or a nested NS federated, 
+        # in case local, we need to extract the json and the domain from the composite entry
+        # we assume that we do not find the entry, because a nested has not own entry in the ns_db
+        nsId_tmp = nsId.split('_')
+        if (request_origin == "local"):
+            log_queue.put(["DEBUG", "Scaling a CONSUMER nested NS"])
+            nested_service_info = ns_db.get_particular_nested_service_info(nsId_tmp[0], nsId)
+        else:
+            # it is an auto-scaling request from the federated domain, but it can be from a nested or a single delegated
+            if (len(nsId_tmp) >1):
+                # auto-scaling of a federated nested NS
+                log_queue.put(["DEBUG", "Scaling a PROVIDER nested NS"])
+                nested_service_info = ns_db.get_particular_nested_service_info(nsId_tmp[1], nsId_tmp[0])
+            else:
+                # auto-scaling of a delegated NS
+                nsId_consumer = ns_db.get_consumer_owner_delegated(nsId)
+                if (nsId_consumer):
+                    nested_service_info =ns_db.get_particular_nested_service_info(nsId_consumer, nsId)
+                else:
+                    log_queue.put(["DEBUG", "This request does not correspond to any ongoing delegated NS"])
+                    return 404
+        nsd_json = nsd_db.get_nsd_json(nested_service_info["nested_id"], None)
+        domain = nested_service_info["domain"]
+    else:
+        nsd_json = nsd_db.get_nsd_json(nsdId, None)
+        domain = nsd_db.get_nsd_domain (nsdId)
     log_queue.put(["DEBUG", "scaling domain: %s"%(domain)])
-    if (domain == "local"):
+    if (domain == "local" and nsId_tmp == None):
+        log_queue.put(["INFO", "*****Time measure: SOEp SOEp delegating the scaling to SOEc"])
         log_queue.put(["DEBUG", "SOEp delegating the SCALING to SOEc"])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp delegating the SCALING to SOEc" % (nsId)])
         ps = Process(target=soe.scale_ns_process, args=(nsId, body))
         ps.start()
         # save process
         soe.processes[operationId] = ps
+        # partial Case 3)
+        # this could be also a reference for a composite so you should wait to update the connections
+        # with associated composites when possible -> assuming that dfs are compatible
+        # we give some time to create the new process, because we need to create 
+        # another one waiting to the previous to finish, in case it is a reference 
+        if ns_db.get_ns_shared_services_ids(nsId):
+            # case we have a reference, the rest of the scaling process, is managed by the SOEp
+            # time.sleep(5)
+            log_queue.put(["INFO", "We need to UPDATE composite NSs associated to this nested NS"])
+            log_queue.put(["INFO", "opening another thread at the SOEp to handle the scaling of associated composites"])
+            # again, assuming that dfs are compatible, in this case we need to update connections
+            log_queue.put(["INFO", "*****Time measure: SOEp SOEp updating composite NS associated to the nested (reference) NS -> parallel thread"])
+            ps2 = Process(target=scale_ns_process, args=(nsId, body, ns_db.get_ns_shared_services_ids(nsId)))
+            ps2.start()
+            processes_parent[operationId] = ps2
+        # Case 4.5)
+        # auto-scaling of a nested federated, so you have to trigger the "update procedure" at the consumer domain
+        ns_record = ns_db.get_ns_record(nsId)
+        # log_queue.put(["DEBUG", "NS_RECORD SCALE_NS: %s"%(ns_record)])
+        if ( ("consumerNsId" in ns_record) and (requester in available_VS)):
+            # we need to launch/inform about the scaling operation in the consumer domain
+            nsId_tmp2 = nsId + '_' + ns_record["consumerNsId"]
+            log_queue.put(["INFO", "*****Time measure: SOEp SOEp informing CONSUMER domain of scaling operation at PROVIDER domain FEDERATED SERVICE"])
+            scale_ns_consumer(nsId_tmp2, body, ns_record["requester"], operationId)
+        if ("Federating service" in ns_record["ns_description"] and not "consumerNsId" in ns_record):
+            log_queue.put(["INFO", "*****Time measure: SOEp SOEp informing CONSUMER domain of scaling operation at PROVIDER domain DELEGATED SERVICE"])
+            # auto-scaled single delegated NS, to warn about the consumer domain
+            scale_ns_consumer(nsId, body, ns_record["requester"], operationId)
     else:
         # soep should do things: there are nested, there is a reference, there is delegation
-        if "nestedNsdId" in nsd_json["nsd"].keys():
-            return 404
-        else:
-            log_queue.put(["DEBUG", "SOEp taking charge of the scaling"])
-            ps = Process(target=scale_ns_process, args=(nsId,body))
-            ps.start()
-            # save process
-            processes_parent[operationId] = ps
-
+        # if "nestedNsdId" in nsd_json["nsd"].keys():
+            # return 404
+        # else:
+            # log_queue.put(["DEBUG", "SOEp taking charge of the scaling"])
+            # ps = Process(target=scale_ns_process, args=(nsId,body))
+            # ps.start()
+            # # save process
+            # processes_parent[operationId] = ps
+        # cases 2), 3), 4) (still to take into account)
+        # in both cases, SOEp takes care
+        log_queue.put(["INFO", "*****Time measure: SOEp SOEp taking care of the scaling"])
+        log_queue.put(["DEBUG", "SOEp taking charge of the scaling"])
+        ps = Process(target=scale_ns_process, args=(nsId,body))
+        ps.start()
+        # save process
+        processes_parent[operationId] = ps
+    log_queue.put(["DEBUG", "The operation ID for the scaling operation END is: %s"%operationId])
     return operationId
 
 
@@ -868,7 +1818,7 @@ def terminate_ns(nsId, requester):
     operationId: string
         Identifier of the operation in charge of terminating the service.
     """
-    log_queue.put(["INFO", "*****Time measure: SOEp SOEp terminating a NS"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp terminating a NS" % (nsId)])
     if not ns_db.exists_nsId(nsId):
         return 404
     registered_requester = ns_db.get_ns_requester(nsId)
@@ -905,12 +1855,12 @@ def terminate_ns(nsId, requester):
         else:
             # this single NS is not being used by other composite/ 
             # or its relations have already finished
-            log_queue.put(["INFO", "SOEp delegating the TERMINATION to SOEc"])
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp delegating the TERMINATION to SOEc" % (nsId)])
             ps = Process(target=soe.terminate_ns_process, args=(nsId, None))
             ps.start()
             soe.processes[operationId] = ps
     else: 
-        log_queue.put(["DEBUG", "SOEp taking charge of the TERMINATION operation"])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEp SOEp taking charge of the TERMINATION operation" % (nsId)])
         ps = Process(target=terminate_ns_process, args=(nsId, None))
         ps.start()
         # save process
@@ -1062,6 +2012,21 @@ def get_operation_status(operationId):
 
     return status
 
+def query_nsds():
+    """
+    Function to get the IFA014 json of all onboarded NSDs
+    Parameters
+    ----------
+    Returns
+    -------
+    list
+        network service IFA014 json descriptors
+    """
+    list_of_nsds= []
+    nsds = nsd_db.get_all_nsd()
+    for nsd in nsds:
+        list_of_nsds.append(nsd["nsdJson"])
+    return list_of_nsds
 
 def query_nsd(nsdId, version):
     """
@@ -1082,10 +2047,26 @@ def query_nsd(nsdId, version):
     if nsd_json is None:
         return 404
     return nsd_json
+    
+def query_vnfds():
+    """
+    Function to get the IFA011 json of all onboarded VNFDs
+    Parameters
+    ----------
+    Returns
+    -------
+    list
+        network service IFA014 json descriptors
+    """
+    list_of_vnfds= []
+    vnfds = vnfd_db.get_all_vnfd()
+    for vnfd in vnfds:
+        list_of_vnfds.append(vnfd["vnfdJson"])
+    return list_of_vnfds
 
 def query_vnfd(vnfdId, version):
     """
-    Function to get the IFA014 json of the VNFD defined by vnfdId and version.
+    Function to get the IFA011 json of the VNFD defined by vnfdId and version.
     Parameters
     ----------
     vnfdId: string
@@ -1122,6 +2103,26 @@ def query_appd(appdId, version):
     if appd_json is None:
         return 404
     return appd_json
+
+def query_pnfd(pnfdId, version):
+    """
+    Function to get the IFA014 json of the PNFD defined by pnfdId and version.
+    Parameters
+    ----------
+    pnfdId: string
+        Identifier of the Physical Network function descriptor.
+    version: string
+        Version of the Physical Network function descriptor.
+
+    Returns
+    -------
+    dict
+        PNF IFA014 json descriptor
+    """
+    pnfd_json = pnfd_db.get_pnfd_json(pnfdId, version)
+    if pnfd_json is None:
+        return 404
+    return pnfd_json
 
 def delete_nsd(nsdId, version):
     """
@@ -1172,6 +2173,23 @@ def delete_appd(appdId, version):
     boolean
     """
     operation_result = appd_db.delete_appd_json(appdId, version)
+    return operation_result
+
+def delete_pnfd(pnfdId, version):
+    """
+    Function to delete from the catalog the PNFD defined by pnfdId and version.
+    Parameters
+    ----------
+    pnfdId: string
+        Identifier of the Physical network function descriptor.
+    version: string
+        Version of the Physical network function descriptor.
+
+    Returns
+    -------
+    boolean
+    """
+    operation_result = pnfd_db.delete_pnfd_json(pnfdId, version)
     return operation_result
 
 def onboard_nsd(nsd_json, requester):
@@ -1316,3 +2334,27 @@ def onboard_appd(body):
     os.remove(filename)
     os.remove(fname) 
     return info
+
+def onboard_pnfd(pnfd_json):
+    """
+    Function to onboard the PNFD contained in the input.
+    Parameters
+    ----------
+    pnfd_json: dict
+        IFA014 network service descriptor.
+    Returns
+    -------
+    pnfdInfoId: string
+        The identifier assigned in the db
+    """
+    pnfd_record = {"pnfdId": pnfd_json["pnfd"]["pnfdId"],
+                  "pnfdVersion": pnfd_json["pnfd"]["version"],
+                  "pnfdName": pnfd_json["pnfd"]["name"],
+                  "pnfdJson": pnfd_json}
+    if pnfd_db.exists_pnfd(pnfd_json["pnfd"]["pnfdId"], pnfd_json["pnfd"]["version"]):
+        # it is an update, so remove previously the descriptor
+        pnfd_db.delete_pnfd_json(pnfd_json["pnfd"]["pnfdId"])
+    # then insert it again (creation or "update")    
+    pnfd_db.insert_pnfd(pnfd_record)
+    # upload the descriptor in the MANO platform...
+    return pnfd_record["pnfdId"]

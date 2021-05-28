@@ -89,10 +89,12 @@ def save_instantiation_info(nsId, body, requester):
         if "network_mapping" in body.additional_param_for_ns:
             # This means that the request is a nested from a federated one
             nestedRequest = loads(body.additional_param_for_ns["network_mapping"]) #this is a list
+            consumerNsId = body.additional_param_for_ns["nsId"] #this is a string
             ns_coll.update_one({"nsId": nsId}, {"$set": {"status": "INSTANTIATING",
                                                          "flavourId": body.flavour_id,
                                                          "nsInstantiationLevelId": body.ns_instantiation_level_id,
                                                          "requester": requester,
+                                                         "consumerNsId": consumerNsId,
                                                          "federatedInfo": nestedRequest}})
         else:
             ns_coll.update_one({"nsId": nsId}, {"$set": {"status": "INSTANTIATING",
@@ -163,7 +165,7 @@ def get_ns_nested_services_ids(nsId):
         Id of the COMPOSITE Network Service Instance
     Returns 
     nested_nsId: string
-        Id of the reference use to instantiate the COMPOSITE Network Service
+        Id of the reference used to instantiate the COMPOSITE Network Service
     """
     ns = ns_coll.find_one({"nsId": nsId})
     if "nestedNsId" in ns:
@@ -209,6 +211,23 @@ def set_ns_shared_services_ids(nsId_owner, nsId_child):
         used_by = ns["used_by"] + used_by
     ns_coll.update_one({"nsId": nsId_owner}, {"$set": {"used_by": used_by}})
 
+def get_ns_shared_services_ids(nsId_owner):
+    """
+    Returns the ids of the composite Ns's using the specified instance
+    ----------
+    nsId_owner: string
+        the identifier of the service that is being used
+    Returns
+    used_by_list: list
+    A list with the composite NSs using this nested NS
+    """
+    ns = ns_coll.find_one({"nsId": nsId_owner})
+    if "used_by" in ns:
+        return ns["used_by"]
+    else:
+        return None
+
+
 def delete_ns_shared_services_ids(nsId_owner, nsId_child):
     """
     Delete in ns_coll the information received in nsId_child, that is, we remove in
@@ -230,6 +249,87 @@ def delete_ns_shared_services_ids(nsId_owner, nsId_child):
             if (ns["used_by"][index] != nsId_child):
                 new_used_by.append(ns["used_by"][index])
     ns_coll.update_one({"nsId": nsId_owner}, {"$set": {"used_by": new_used_by}})
+
+
+def get_consumer_owner_delegated(nsId_provider):
+    """
+    Given the case of autoscaling of a delegated single NS, we need to know the nsId_owner, given the
+    nsId in the provider domain
+    """
+    # according to documentation, it only takes the first match, but it is enough because the nsId_provider is unique
+    #ns = ns_coll.find({"nested_service_info": {$elemMatch: {"nested_instance_id": nsId_provider}}}).pretty()
+    ns = ns_coll.find({"nested_service_info": {"nested_instance_id": nsId_provider}})
+    if (ns):
+        return ns["nsId"]
+    else:
+        return None
+
+
+def set_federated_pairs(nsId, pairs_a, pairs_b):
+    """
+    Save in ns_coll the different federated pairs that are used in a composite (including possible nested references)
+    ----------
+    nsId: string
+        Identifier of the composite NS
+    pairs_a: list
+        List including the pairs local-federated that have internested connections
+    pairs_b: list
+        List including the pairs federated-federated that have internested connections
+    Returns
+    -------
+    None
+    """
+    ns = ns_coll.find_one({"nsId": nsId})
+    if "nested_service_info" in ns:
+        # a sanity check to verify that we are in a composite ns
+        ns_coll.update_one({"nsId": nsId}, {"$set": {"federated_pairs": [pairs_a, pairs_b]}})
+
+def get_federated_pairs(nsId):
+    """
+    Get in ns_coll the different federated pairs that are used in a composite (including possible nested references)
+    ----------
+    nsId: string
+        Identifier of the composite NS
+    Returns
+    -------
+    federated_pairs: list
+        List including the pairs local-federated [0] and the pairs federated-federated[1] that have internested connections
+    """
+    ns = ns_coll.find_one({"nsId": nsId})
+    if "nested_service_info" in ns:
+        # a sanity check to verify that we are in a composite ns
+        return ns["federated_pairs"]
+    else:
+        return []
+
+def set_nested_connections_local_federated(nsId, nested_connections_info_local_federated):
+    ns = ns_coll.find_one({"nsId": nsId})
+    if "nested_service_info" in ns:
+        # a sanity check to verify that we are in a composite ns
+        ns_coll.update_one({"nsId": nsId}, {"$set": {"connections_local_federated": nested_connections_info_local_federated}})
+
+def get_nested_connections_local_federated(nsId):
+    ns = ns_coll.find_one({"nsId": nsId})
+    if "nested_service_info" in ns:
+        # a sanity check to verify that we are in a composite ns
+        return ns["connections_local_federated"]
+    else:
+        return []
+
+def set_nested_connections_federated_federated(nsId, nested_connections_info_federated_federated):
+    ns = ns_coll.find_one({"nsId": nsId})
+    if "nested_service_info" in ns:
+        # a sanity check to verify that we are in a composite ns
+        ns_coll.update_one({"nsId": nsId}, {"$set": {"connections_federated_federated": nested_connections_info_local_federated}})
+
+def get_nested_connections_federated_federated(nsId):
+    ns = ns_coll.find_one({"nsId": nsId})
+    if "nested_service_info" in ns:
+        # a sanity check to verify that we are in a composite ns
+        return ns["connections_federated_federated"]
+    else:
+        return []
+
 
 def save_sap_info(nsId, sapInfo):
     """
@@ -496,6 +596,20 @@ def set_monitoring_info(nsId, info):
     """
     ns_coll.update_one({"nsId": nsId}, {"$set": {"monitoring_jobs": info}})
 
+def set_forecasting_info(nsId, info):
+    """
+    Adds the list of forecasting jobs for this NS instance.
+    ----------
+    nsId: string
+        Reference to the appropriate nsId
+    info: list
+        List of forecasting jobs (including identifiers)
+    Returns
+    -------
+    None
+    """
+    ns_coll.update_one({"nsId": nsId}, {"$set": {"forecasting_jobs": info}})
+
 def set_nested_service_info(nsId):
     """
     Creates the entry to store information related to nested services 
@@ -508,7 +622,7 @@ def set_nested_service_info(nsId):
     """
     ns_coll.update_one({"nsId": nsId}, {"$set": {"nested_service_info": []}})
 
-def update_monitoring_info(nsId, info, old_info):
+def update_monitoring_info(nsId, info, old_infos):
     """
     Updates the list of monitoring jobs for this NS instance.
     ----------
@@ -521,14 +635,20 @@ def update_monitoring_info(nsId, info, old_info):
     None
     """
     pm_jobs = get_monitoring_info(nsId)
-    # first, remove the ones that are not needed
-    for index_a in range(0,len(pm_jobs)):
-        for index_b in range (0, len(old_info)):
-            if (pm_jobs[index_a]['exporterId'] == old_info[index_b]):
-                deleted_pm_jobs = pm_jobs.pop(index_a)  
+    return_pm_jobs = []
+    for pm_job in pm_jobs:
+        is_found = False
+        if "exporterId" in pm_job.keys():
+            for old_info in old_infos:
+                if pm_job['exporterId'] == old_info:
+                    is_found = True
+                    break
+        if is_found != True:
+            return_pm_jobs.append(pm_job)
     # second, update the monitoring info
-    pm_jobs = pm_jobs + info
+    pm_jobs = return_pm_jobs + info
     set_monitoring_info(nsId, pm_jobs)
+
 
 def update_nested_service_info(nsId, info, operation, nestedId=None):
     """
@@ -575,6 +695,30 @@ def get_nested_service_info(nsId):
     else:
         return []
 
+def get_particular_nested_service_info(nsId, nestedId):
+    """
+       Function to get the instantation characteristics of an specific nested 
+       Parameters
+      ----------
+      nsId: string
+          Identifier of the Network Service Instance.
+      nsestedId: string
+          Identifier of nested to be reported.
+
+      Returns
+      -------
+      dict
+          information related with each of the instantiated nested services.
+      """
+    ns = ns_coll.find_one({"nsId": nsId})
+    if "nested_service_info" in ns:
+        for elem in ns["nested_service_info"]:
+            if (elem["nested_instance_id"] == nestedId):
+                return elem
+    else:
+        return []
+
+
 def set_alert_info(nsId, info):
     """
     Adds the list of alerts ids for this NS instance.
@@ -602,6 +746,24 @@ def get_monitoring_info(nsId):
     ns = ns_coll.find_one({"nsId": nsId})
     if "monitoring_jobs" in ns: 
         return ns["monitoring_jobs"]
+    else:
+        return []
+
+def get_forecasting_info(nsId):
+    """
+    Returns the list of forecasting jobs ids of this NS instance.
+    ----------
+    nsId: string
+        Identifier of the Network Service Instance.
+    Returns
+    -------
+    List 
+        List of dictionaries containing the forecasting ids associated to the nsId.
+        key: "forecastId"
+    """
+    ns = ns_coll.find_one({"nsId": nsId})
+    if "forecasting_jobs" in ns: 
+        return ns["forecasting_jobs"]
     else:
         return []
 
@@ -652,6 +814,38 @@ def get_dashboard_info(nsId):
     else:
         return {}
 
+def set_logs_dashboard_info(nsId, info):
+    """
+    Adds the id and URL of the logs dashboard associated with this NS instance.
+    ----------
+    info: Dictionary
+        Dictionary with logs dashboard info ("dashboardId" and "dashboardUrl" as keys) associated to the Network service
+    Returns
+    -------
+    None
+    """
+    ns_coll.update_one({"nsId": nsId}, {"$set": {"logs_dashboard_info": info}})
+
+
+def get_logs_dashboard_info(nsId):
+    """
+    Returns the id of the logs dashboard associated to this NS instance.
+    ----------
+    nsId: string
+        Identifier of the Network Service Instance.
+    Returns
+    -------
+    String
+        Id of the logs dashboard associated to the nsId.
+    """
+    ns = ns_coll.find_one({"nsId": nsId})
+    if "logs_dashboard_info" in ns:
+        return ns["logs_dashboard_info"]
+    else:
+        return {}
+
+
+
 def get_aiml_info(nsId, problem):
     """
     Returns the information related to the aiml dictionary storing information
@@ -700,8 +894,8 @@ def set_aiml_info(nsId, problem, aiml_info):
         aiml_dict = {}
         aiml_dict[problem] = aiml_info
     ns_coll.update_one({"nsId": nsId}, {"$set": {"aiml_info": aiml_dict}})
-    
-    
+
+
 
 
 

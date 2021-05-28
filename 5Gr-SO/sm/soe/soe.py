@@ -21,6 +21,7 @@ import os
 import tarfile
 from uuid import uuid4
 from multiprocessing import Process, Queue
+from datetime import datetime
 
 import wget
 from pymongo import MongoClient
@@ -37,7 +38,9 @@ from db.ns_db import ns_db
 from db.nsd_db import nsd_db
 from db.vnfd_db import vnfd_db
 from db.appd_db import appd_db
+from db.pnfd_db import pnfd_db
 from db.operation_db import operation_db
+from db.notification_db import notification_db
 from sm.rooe import rooe
 from nbi import log_queue
 from monitoring import monitoring, alert_configure
@@ -99,7 +102,7 @@ def instantiate_ns_process(nsId, body, nestedInfo=None):
     name: type
         return description
     """
-    log_queue.put(["INFO", "*****Time measure: SOEc SOEc instantiating a NS"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc instantiating a NS" % (nsId)])
     log_queue.put(["INFO", "SOEc instantiate_ns_process with nsId %s, body %s" % (nsId, body)])
     # get the nsdId that corresponds to nsId
     nsdId = ns_db.get_nsdId(nsId)
@@ -115,21 +118,30 @@ def instantiate_ns_process(nsId, body, nestedInfo=None):
         log_queue.put(["DEBUG", vnfdId])
         vnfds_json[vnfdId] = vnfd_db.get_vnfd_json(vnfdId, None)
     # request RO
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc retreiving descriptors for a NS" % (nsId)])
     rooe.instantiate_ns(nsId, nsd_json, vnfds_json, body, nestedInfo)
-    log_queue.put(["INFO", "*****Time measure: SOEc updated databases instantiating"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc-ROE updated DBs instantiating a NS" % (nsId)])
     sap_info = ns_db.get_ns_sap_info(nsId)
     if (len(sap_info) > 0):
       log_queue.put(["INFO", "sapInfo: %s"% (sap_info)])
       monitoring.configure_ns_monitoring(nsId, nsd_json, vnfds_json, sap_info)
+      log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc finished configuring monitoring/dashboard" % (nsId)])
       log_queue.put(["INFO", "instantiate_ns monitoring exporters created for nsId %s" % (nsId)])
       # initiate alerts
       alert_configure.configure_ns_alerts(nsId, nsdId, nsd_json, vnfds_json, sap_info)
+      log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc finished configuring Threshold-based alerts" % (nsId)])
       # initiate aiml work for "scaling" problem
       alert_configure.configure_ns_aiml_scale_work(nsId, nsdId, nsd_json, vnfds_json, sap_info)
-      log_queue.put(["INFO", "*****Time measure: SOEc created monitoring exporters and alerts"]) 
-    log_queue.put(["INFO", "*****Time measure: SOEc instantiate_ns_process finished for nsId %s" % (nsId)])
+      log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc finished configuring AIML alerts" % (nsId)]) 
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc finished instantiating a NS" % (nsId)])
+    notification_db.create_notification_record({
+        "nsId": nsId,
+        "type": "fa-send",
+        "text": nsId + " INSTANTIATED",
+        "time": datetime.now().strftime("%d/%m/%Y %H:%M:%S.%f")
+      })
 
-def scale_ns_process(nsId, body):
+def scale_ns_process(nsId, body, nestedInfo=None):
     """
     Performs the scaling of the service identified by "nsId" according to the info at body 
     Parameters
@@ -140,12 +152,18 @@ def scale_ns_process(nsId, body):
     Returns
     -------
     """
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc scaling a nested/regular NS" % nsId])
     log_queue.put(["INFO", "scale_ns_process with nsId %s, body %s" % (nsId, body)])
     # get the nsdId that corresponds to nsId
-    nsdId = ns_db.get_nsdId(nsId)
-    # get current instantiation level
-    current_df = ns_db.get_ns_df(nsId)
-    current_il = ns_db.get_ns_il(nsId)
+    if nestedInfo:
+        nsdId = next(iter(nestedInfo))
+        current_df = nestedInfo[nsdId][0]
+        current_il = nestedInfo[nsdId][1]
+    else:
+        nsdId = ns_db.get_nsdId(nsId)
+        # get current instantiation level
+        current_df = ns_db.get_ns_df(nsId)
+        current_il = ns_db.get_ns_il(nsId)
     # first get the ns and vnfs descriptors
     nsd_json = nsd_db.get_nsd_json(nsdId, None)
     # for each vnf in the NSD, get its json descriptor
@@ -155,20 +173,40 @@ def scale_ns_process(nsId, body):
         vnfds_json[vnfdId] = vnfd_db.get_vnfd_json(vnfdId, None)
     #request RO
     sap_info_pre_scaling = ns_db.get_ns_sap_info(nsId)
-    rooe.scale_ns(nsId, nsd_json, vnfds_json, body, current_df, current_il)
-    # maybe we have to update the monitoring jobs: we assume that new performance monitoring jobs
-    # will be similar to one already present
-    sap_info = ns_db.get_ns_sap_info(nsId)
-    log_queue.put(["INFO", "new sapInfo after scaling: %s"% (sap_info)])
-    monitoring.update_ns_monitoring(nsId, nsd_json, vnfds_json, sap_info)
-    log_queue.put(["DEBUG", "monitoring exporters updated after scaling for nsId %s" % (nsId)])
-    # update alerts: it is not needed
-    # however, in the case of aiml_scaling it is needed
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc-ROE prepared info for scaling" % (nsId)])
+    rooe.scale_ns(nsId, nsd_json, vnfds_json, body, current_df, current_il, nestedInfo)
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc-ROE updated DBs scaling a NS" % (nsId)])
+    # checks the result of scaling, maybe it has not be done due to lack of resources
+    operationId = operation_db.get_operationId(nsId, "INSTANTIATION")
+    if ((operation_db.get_operation_status(operationId) == "SUCCESSFULLY_DONE") and ns_db.get_ns_status(nsId) == "INSTANTIATED"):       
+        # maybe we have to update the monitoring jobs: we assume that new performance monitoring jobs
+        # will be similar to one already present
+        sap_info = ns_db.get_ns_sap_info(nsId)
+        log_queue.put(["INFO", "new sapInfo after scaling: %s"% (sap_info)])
+        monitoring.update_ns_monitoring(nsId, nsd_json, vnfds_json, sap_info)
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc updated monitoring info" % nsId])
+        log_queue.put(["DEBUG", "monitoring exporters updated after scaling for nsId %s" % (nsId)])
+        # update alerts: it is not needed
+    # however, in the case of aiml_scaling it is needed, to restart the spark job
+    else: 
+        if ns_db.get_ns_status(nsId) == "INSTANTIATED":
+            log_queue.put(["DEBUG", "Scaling operation failed due to lack of resources"])
+        elif ns_db.get_ns_status(nsId) == "FAILED":
+            log_queue.put(["DEBUG", "Scaling operation failed at the MANO platform"])
     aiml_scaling_info = ns_db.get_aiml_info(nsId, "scaling")
-    if (aiml_scaling_info):
+    if (aiml_scaling_info and (ns_db.get_ns_status(nsId) == "INSTANTIATED")):
         log_queue.put(["DEBUG", "The AIML platform is triggering the scaling operation"])
         alert_configure.update_ns_aiml_scale_work(nsId, aiml_scaling_info)
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc updated AIML alert job" % nsId])
     log_queue.put(["INFO", "scale_ns_process finished for nsId %s" % (nsId)])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc finished scaling a nested/regular NS" % (nsId)])
+    notification_db.create_notification_record({
+        "nsId": nsId,
+        "type": "fa-gears",
+        "text": nsId + " SCALED",
+        "time": datetime.now().strftime("%d/%m/%Y %H:%M:%S.%f")
+      })
+
 
 
 
@@ -186,20 +224,29 @@ def terminate_ns_process(nsId, aux):
     """
     #first terminate the alert/monitoring jobs
     # When alert rest API will be ready uncomment
-    log_queue.put(["INFO", "SOEc eliminating service with nsId: %s"%nsId])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc terminating service"% nsId])
     if (nsId.find("_") == -1):
         # terminate aiml scaling jobs
         alert_configure.delete_ns_aiml_scale_work(nsId)
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc terminated AIML alert jobs"% nsId])
         # terminate alerts
         alert_configure.delete_ns_alerts(nsId)
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc terminated Threshold-based alert jobs"% nsId])
         # terminate monitoring jobs
         monitoring.stop_ns_monitoring(nsId)
-        log_queue.put(["INFO", "*****Time measure: SOEc terminated monitoring exporters and alerts"])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc terminated Monitoring and dashboard" % nsId])
     #terminate the service
     rooe.terminate_ns(nsId)
-    log_queue.put(["INFO", "*****Time measure: SOEc updated databases terminating"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc terminated service" % nsId])
     # for the 5Gr-VS not to break
     # ns_db.delete_ns_record(nsId)
+    notification_db.create_notification_record({
+        "nsId": nsId,
+        "type": "fa-trash",
+        "text": nsId + " TERMINATED",
+        "time": datetime.now().strftime("%d/%m/%Y %H:%M:%S.%f")
+    })
+
 
 ########################################################################################################################
 # PUBLIC METHODS                                                                                                       #
@@ -290,7 +337,7 @@ def scale_ns(nsId, body):
     string
         Id of the operation associated to the Network Service instantiation.
     """
-
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc scaling a nested/regular NS" % (nsId)])
     log_queue.put(["INFO", "scale_ns for nsId %s with body: %s" % (nsId, body)])
     # client = MongoClient()
     # fgtso_db = client.fgtso
@@ -309,7 +356,7 @@ def scale_ns(nsId, body):
 
     # save process
     processes[operationId] = ps
-
+    # log_queue.put(["INFO", "*****Time measure for nsId: %s: SOEc SOEc returned scaling operation ID at SOEc" % (nsId)])
     return operationId
 
 def terminate_ns(nsId, requester):
@@ -519,6 +566,26 @@ def query_appd(appdId, version):
         return 404
     return appd_json
 
+def query_pnfd(pnfdId, version):
+    """
+    Function to get the IFA014 json of the PNFD defined by pnfdId and version.
+    Parameters
+    ----------
+    pnfdId: string
+        Identifier of the Physical Network function descriptor.
+    version: string
+        Version of the Physical Network function descriptor.
+
+    Returns
+    -------
+    dict
+        PNF IFA014 json descriptor
+    """
+    pnfd_json = pnfd_db.get_pnfd_json(pnfdId, version)
+    if pnfd_json is None:
+        return 404
+    return pnfd_json
+
 def delete_nsd(nsdId, version):
     """
     Function to delete from the catalog the NSD defined by nsdId and version.
@@ -570,6 +637,23 @@ def delete_appd(appdId, version):
     operation_result = appd_db.delete_appd_json(appdId, version)
     return operation_result
 
+def delete_pnfd(pnfdId, version):
+    """
+    Function to delete from the catalog the PNFD defined by pnfdId and version.
+    Parameters
+    ----------
+    pnfdId: string
+        Identifier of the Physical network function descriptor.
+    version: string
+        Version of the Physical network function descriptor.
+
+    Returns
+    -------
+    boolean
+    """
+    operation_result = pnfd_db.delete_pnfd_json(pnfdId, version)
+    return operation_result
+
 def onboard_nsd(nsd_json, requester):
     """
     Function to onboard the NSD contained in the input.
@@ -612,6 +696,30 @@ def onboard_nsd_mano(nsd_json):
     None
     """
     rooe.onboard_nsd_mano(nsd_json)
+
+def onboard_pnfd(pnfd_json):
+    """
+    Function to onboard the PNFD contained in the input.
+    Parameters
+    ----------
+    pnfd_json: dict
+        IFA014 network service descriptor.
+    Returns
+    -------
+    pnfdInfoId: string
+        The identifier assigned in the db
+    """
+    pnfd_record = {"pnfdId": pnfd_json["pnfd"]["pnfdId"],
+                  "pnfdVersion": pnfd_json["pnfd"]["version"],
+                  "pnfdName": pnfd_json["pnfd"]["name"],
+                  "pnfdJson": pnfd_json}
+    if pnfd_db.exists_pnfd(pnfd_json["pnfd"]["pnfdId"], pnfd_json["pnfd"]["version"]):
+        # it is an update, so remove previously the descriptor
+        pnfd_db.delete_pnfd_json(pnfd_json["pnfd"]["pnfdId"])
+    # then insert it again (creation or "update")    
+    pnfd_db.insert_pnfd(pnfd_record)
+    # upload the descriptor in the MANO platform...
+    return pnfd_record["pnfdId"]
 
 def onboard_vnfd(body):
     """

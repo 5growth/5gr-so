@@ -16,7 +16,7 @@
 Database of Network Service Instances
 DB structure:
     nsId: string
-    status: string  (one of: NOT_INSTANTIATED, INSTANTIATING, INSTANTIATED, TERMINATING, TERMINATED)
+    status: string  (one of: NOT_INSTANTIATED, INSTANTIATING, INSTANTIATED, TERMINATING, TERMINATED, SCALING)
     nsdId: string
     nsDescription: string
     nsName: string

@@ -107,6 +107,22 @@ def save_vnf_deployed_info(nsId, vnf_deployed_info):
     """
     nsir_coll.update_one({"nsId": nsId}, {"$set": {"vnf_info": vnf_deployed_info}})
 
+def save_map_reference_ip(nsId, map_reference_ip):
+    """
+    Function to save the information map IFA reference to ip addresses .
+    Parameters
+    ----------
+    nsId: string
+        Identifier of the Network Service Instance.
+    map_reference_ip: dict
+        map IFA reference to ip addresses.
+    Returns
+    -------
+    None
+    """
+    nsir_coll.update_one({"nsId": nsId}, {"$set": {"map_reference_ip": map_reference_ip}})
+
+
 
 def get_placement_info(nsId):
     """
@@ -162,6 +178,26 @@ def get_vnf_deployed_info(nsId):
 
     if "vnf_info" in nsir:
         return nsir["vnf_info"]
+    else:
+        return None
+
+def get_map_reference_ip(nsId):
+    """
+    Function to get the info of map IFA reference to ip addresses.
+    Parameters
+    ----------
+    nsId: string
+        Identifier of the Network Service Instance.
+
+    Returns
+    -------
+    vnf_info: dict
+        Information map IFA reference to ip addresses.
+    """
+    nsir = nsir_coll.find_one({"nsId": nsId})
+
+    if "map_reference_ip" in nsir:
+        return nsir["map_reference_ip"]
     else:
         return None
 
@@ -228,6 +264,28 @@ def set_network_renaming_mapping(renaming_mapping,nsId):
     #no need to check if exists, because if not it is created by the set_network_mapping op
     nsir_coll.update_one({"nsId": nsId}, {"$set": {"renaming_mapping": renaming_mapping}})
 
+def set_nested_local_connections(local_connections, nsId):
+    """
+    Function to save information of interconnections between nested NSs deployed locally
+    Parameters
+    ----------
+    nsId: string
+        Identifier of the Network Service Instance.
+    local_connections: dict
+        dictionary with information determined by CROOE module related to 
+        pairs of VNFs of different nested NSs deployed locally that need to be interconnected
+    Returns
+    -------
+    None
+    """
+    if exists_nsir (nsId):
+        nsir_coll.update_one({"nsId": nsId}, {"$set": {"nested_local_interconnect": local_connections}})
+    else: 
+        nsir_record = {"nsId": nsId,
+                       "nested_local_interconnect": local_connections
+                      }
+        nsir_coll.insert_one(nsir_record)  
+
 def get_network_mapping(nsId):
     """
     Function to get the information of network mapping between composite network service and its nested
@@ -265,6 +323,25 @@ def get_renaming_network_mapping(nsId):
         return nsir["renaming_mapping"]
     else:
         return {}
+
+def get_nested_local_connections(nsId):
+    """
+    Function to get the information of local_interconnections between nested NSs of a composite network 
+    Parameters
+    ----------
+    nsId: string
+        Identifier of the Network Service Instance.
+    Returns
+    -------
+    nested_local_interconnect: dict
+        dictionary with information extracted from CROOE module related to internested connections 
+    """
+    nsir = nsir_coll.find_one({"nsId": nsId})
+    if "nested_local_interconnect" in nsir:
+        return nsir["nested_local_interconnect"]
+    else:
+        return {}
+
 
 def get_vls(nsId):
     """

@@ -20,6 +20,8 @@ from db.nsir_db import nsir_db
 from db.ns_db import ns_db
 from nbi import log_queue
 
+notification = []
+
 
 def selected_node(graph, name):
     """

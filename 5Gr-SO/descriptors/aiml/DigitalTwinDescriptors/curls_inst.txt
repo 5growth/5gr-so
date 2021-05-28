@@ -1,0 +1,7 @@
+#curls for the DigitalTwin PoC
+
+curl -v -X POST -d @ControlApp_vnfd.json http://10.0.200.212:8080/5gt/so/v1/ns/vnfdManagement/vnfPackage --header "Content-Type:application/json"
+curl -v -X POST -d @DTApp_vnfd.json http://10.0.200.212:8080/5gt/so/v1/ns/vnfdManagement/vnfPackage --header "Content-Type:application/json"
+
+NSD (from inside /descriptors folder)
+curl -v -X POST -d @DT_NSD_sin_aiml.json http://localhost:8080/5gt/so/v1/ns/nsdManagement/nsd --header "Content-Type:application/json"

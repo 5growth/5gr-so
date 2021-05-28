@@ -1,0 +1,130 @@
+{
+	"vnfdId": "DTApp_VNF",
+	"vnfProvider": "UC3M-CTTC",
+	"vnfProductName": "DTApp_VNF",
+	"vnfSoftwareVersion": "0.1",
+	"vnfdVersion": "0.2",
+	"vnfProductInfoName": "DTApp_VNF",
+	"vnfProductInfoDescription": "DTApp_VNF",
+	"vnfmInfo": ["DTApp_VNFM"],
+	"localizationLanguage": [],
+	"defaultLocalizationLanguage": "",
+	"vdu": [{
+		"vduId": "DTApp_vdu",
+		"name": "DTApp_VNF",
+		"description": "VDU of the DTApp_VNF",
+		"intCpd": [{
+			"cpdId": "dtapp_mgt_intcp",
+			"layerProtocol": "IPV4",
+			"description": "Management CP of the central DTApp",
+			"addressData": [{
+				"addressType": "IP_ADDRESS",
+				"iPAddressAssignment": false,
+				"floatingIpActivated": true,
+				"management": true,
+				"iPAddressType": "IPv4",
+				"numberOfIpAddress": 1
+			}]
+		}],
+		"virtualComputeDesc": "VCD_DTApp",
+		"virtualStorageDesc": ["VSD_DTApp"],
+		"bootOrder": {},
+		"swImageDesc": {
+			"id": "DTApp_SWID",
+			"name": "cirros_cttc",
+			"version": "0.1",
+			"checksum": "TBD",
+			"containerFormat": "QCOW2",
+			"diskFormat": "QCOW2",
+			"minDisk": 1,
+			"minRam": 2,
+			"size": 20,
+			"swImage": "cirros_cttc",
+			"operatingSystem": "Ubuntu-16.04.5",
+			"supportedVirtualisationEnvironment": ""
+		},
+		"nfviConstraint": [],
+		"monitoringParameter": [],
+		"configurableProperties": {}
+	}],
+	"virtualComputeDesc": [{
+		"virtualComputeDescId": "VCD_DTApp",
+		"logicalNode": {},
+		"virtualMemory": {
+			"virtualMemSize": 2,
+			"virtualMemOversubscriptionPolicy": "asdasd",
+			"numaEnabled": false
+		},
+		"virtualCpu": {
+			"numVirtualCpu": 2,
+			"cpuArchitecture": "x86_64",
+			"virtualCpuClock": 0,
+			"virtualCpuOversubscriptionPolicy": "asdasd"
+		}
+	}],
+	"virtualStorageDesc": [{
+		"id": "VSD_DTApp",
+		"typeOfStorage": "VOLUME",
+		"sizeOfStorage": 20,
+		"rdmaEnabled": false,
+		"swImageDesc": "DTApp_SWID"
+	}],
+	"intVirtualLinkDesc": [],
+	"vnfExtCpd": [{
+		"cpdId": "dtapp_mgt_extcp",
+		"layerProtocol": "IPV4",
+		"description": "Management external CP of the DTApp",
+		"addressData": [{
+			"addressType": "IP_ADDRESS",
+			"iPAddressAssignment": false,
+			"floatingIpActivated": true,
+			"management": true,
+			"iPAddressType": "IPv4",
+			"numberOfIpAddress": 1
+		}],
+		"intCpd": "dtapp_mgt_intcp"
+	}],
+	"deploymentFlavour": [{
+		"flavourId": "DTApp_VNF_df",
+		"description": "Standard deployment flavour of the DTApp",
+		"vduProfile": [{
+			"vduId": "DTApp_vdu",
+			"minNumberOfInstances": 1,
+			"maxNumberOfInstances": 1
+		}],
+		"instantiationLevel": [{
+			"levelId": "il_DTApp",
+			"description": "Standard instantiation level of the DTApp",
+			"vduLevel": [{
+				"vduId": "DTApp_vdu",
+				"numberOfInstances": 1
+			}]
+		}],
+		"vnfLcmOperationsConfiguration": {},
+		"defaultInstantiationLevelId": "",
+		"supportedOperation": [],
+		"affinityOrAntiAffinityGroup": [],
+		"monitoringParameter": [],
+		"scalingAspect": []
+	}],
+	"configurableProperties": {
+			"autoScalable": false,
+			"autoHealable": false,
+			"additionalConfigurableProperty": [ ]
+	},
+	"modifiableAttributes": {},
+	"lifeCycleManagementScript": [{
+		"event": ["START_VNF_INSTANTIATION"],
+		"script": ""
+	}, {
+		"event": ["END_VNF_INSTANTIATION"],
+		"script": ""
+	}, {
+		"event": ["START_VNF_TERMINATION"],
+		"script": ""
+	}, {
+		"event": ["END_VNF_TERMINATION"],
+		"script": ""
+	}],
+	"elementGroup": []
+}

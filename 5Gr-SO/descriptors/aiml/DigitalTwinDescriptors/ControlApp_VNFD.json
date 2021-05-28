@@ -1,0 +1,136 @@
+{
+	"vnfdId": "ControlApp_VNF",
+	"vnfProvider": "UC3M-CTTC",
+	"vnfProductName": "ControlApp_VNF",
+	"vnfSoftwareVersion": "0.1",
+	"vnfdVersion": "0.2",
+	"vnfProductInfoName": "ControlApp_VNF",
+	"vnfProductInfoDescription": "ControlApp_VNF",
+	"vnfmInfo": ["ControlApp_VNFM"],
+	"localizationLanguage": [],
+	"defaultLocalizationLanguage": "",
+	"vdu": [{
+		"vduId": "ControlApp_vdu",
+		"name": "ControlApp_VNF",
+		"description": "VDU of the ControlApp_VNF",
+		"intCpd": [{
+			"cpdId": "control_app_mgt_intcp",
+			"layerProtocol": "IPV4",
+			"description": "Management CP of the app server",
+			"addressData": [{
+				"addressType": "IP_ADDRESS",
+				"iPAddressAssignment": false,
+				"floatingIpActivated": true,
+				"management": true,
+				"iPAddressType": "IPv4",
+				"numberOfIpAddress": 1
+			}]
+		}],
+		"virtualComputeDesc": "VCD_ControlApp",
+		"virtualStorageDesc": ["VSD_ControlApp"],
+		"bootOrder": {},
+		"swImageDesc": {
+			"id": "ControlApp_SWID",
+			"name": "cirros_cttc_vmexporter",
+			"version": "0.1",
+			"checksum": "TBD",
+			"containerFormat": "QCOW2",
+			"diskFormat": "QCOW2",
+			"minDisk": 1,
+			"minRam": 2,
+			"size": 20,
+			"swImage": "cirros_cttc_vmexporter",
+			"operatingSystem": "Ubuntu-16.04.5",
+			"supportedVirtualisationEnvironment": ""
+		},
+		"nfviConstraint": [],
+		"monitoringParameter": [],
+		"configurableProperties": {}
+	}],
+	"virtualComputeDesc": [{
+		"virtualComputeDescId": "VCD_ControlApp",
+		"logicalNode": {},
+		"virtualMemory": {
+			"virtualMemSize": 2,
+			"virtualMemOversubscriptionPolicy": "asdasd",
+			"numaEnabled": false
+		},
+		"virtualCpu": {
+			"numVirtualCpu": 2,
+			"cpuArchitecture": "x86_64",
+			"virtualCpuClock": 0,
+			"virtualCpuOversubscriptionPolicy": "asdasd"
+		}
+	}],
+	"virtualStorageDesc": [{
+		"id": "VSD_ControlApp",
+		"typeOfStorage": "VOLUME",
+		"sizeOfStorage": 20,
+		"rdmaEnabled": false,
+		"swImageDesc": "ControlApp_SWID"
+	}],
+	"intVirtualLinkDesc": [],
+	"vnfExtCpd": [{
+		"cpdId": "control_app_mgt_extcp",
+		"layerProtocol": "IPV4",
+		"description": "Management external CP of the ControlApp",
+		"addressData": [{
+			"addressType": "IP_ADDRESS",
+			"iPAddressAssignment": false,
+			"floatingIpActivated": true,
+			"management": true,
+			"iPAddressType": "IPv4",
+			"numberOfIpAddress": 1
+		}],
+		"intCpd": "control_app_mgt_intcp"
+	}],
+	"deploymentFlavour": [{
+		"flavourId": "ControlApp_VNF_df",
+		"description": "Standard deployment flavour of the ControlApp",
+		"vduProfile": [{
+			"vduId": "ControlApp_vdu",
+			"minNumberOfInstances": 1,
+			"maxNumberOfInstances": 1
+		}],
+		"instantiationLevel": [{
+			"levelId": "il_ControlApp",
+			"description": "Standard instantiation level of the ControlApp",
+			"vduLevel": [{
+				"vduId": "ControlApp_vdu",
+				"numberOfInstances": 1
+			}]
+		}],
+		"vnfLcmOperationsConfiguration": {},
+		"defaultInstantiationLevelId": "",
+		"supportedOperation": [],
+		"affinityOrAntiAffinityGroup": [],
+		"monitoringParameter": [],
+		"scalingAspect": [{
+            "id": "ControlApp_VNF",
+            "name": "ControlApp_VNF",
+            "description": "ControlApp_VNF",
+            "associatedGroup": "",
+            "maxScaleLevel": 5
+        }]
+	}],
+	"configurableProperties": {
+			"autoScalable": false,
+			"autoHealable": false,
+			"additionalConfigurableProperty": [ ]
+	},
+	"modifiableAttributes": {},
+	"lifeCycleManagementScript": [{
+		"event": ["START_VNF_INSTANTIATION"],
+		"script": ""
+	}, {
+		"event": ["END_VNF_INSTANTIATION"],
+		"script": ""
+	}, {
+		"event": ["START_VNF_TERMINATION"],
+		"script": ""
+	}, {
+		"event": ["END_VNF_TERMINATION"],
+		"script": ""
+	}],
+	"elementGroup": []
+}

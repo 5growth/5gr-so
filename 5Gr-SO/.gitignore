@@ -132,4 +132,8 @@ dmypy.json
 .pyre/
 
 .idea/
-
+5GT-SO/nbi/python-flask-server/swagger_server/__pycache__/
+5GT-SO/nbi/python-flask-server/swagger_server/controllers/__pycache__/
+5GT-SO/nbi/python-flask-server/swagger_server/models/__pycache__/
+5GT-SO/coreMano/cloudify_wrapper_lib/cloudify_rest_client/__pycache__/
+5GT-SO/coreMano/cloudify_wrapper_lib/cloudify_rest_client/aria/__pycache__/

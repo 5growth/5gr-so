@@ -462,29 +462,28 @@ class ConverterNSDMTPYAML(object):
                     number_of_instances = vnfd_profile['numberOfInstances']
                     break
 
-            if number_of_instances > 1:
-                instance_number = 2
-                while instance_number <= number_of_instances:
-                    new_server_name = server_name + "_" + str(instance_number).zfill(2)
-                    new_servers.update({new_server_name: copy.deepcopy(self.servers[server_name])})
-                    new_ports = {}
-                    for port_name, port_value in new_servers[new_server_name]['relations']['ports'].items():
-                        new_port_name = port_name + "_" + str(instance_number).zfill(2)
-                        # change name in scripts
-                        if "script" in new_servers[new_server_name]:
-                            for script in new_servers[new_server_name]['script']:
-                                for script_name, script_value in script.items():
-                                    if script_name == "target":
-                                        if script_value == server_name:
-                                            script['target'] = new_server_name
-                                        continue
-                                    self.change_script_args(script_value,
-                                                            server_name, new_server_name,
-                                                            port_name, new_port_name)
-                        new_ports[new_port_name] = port_value
-                    new_servers[new_server_name]['relations']['ports'] = new_ports
-                    instance_number += 1
-        self.servers.update(new_servers)
+            instance_number = 1
+            while instance_number <= number_of_instances:
+                new_server_name = self.__ns_service_id + "-0-" + server_name + "-" + str(instance_number)
+                new_servers.update({new_server_name: copy.deepcopy(self.servers[server_name])})
+                new_ports = {}
+                for port_name, port_value in new_servers[new_server_name]['relations']['ports'].items():
+                    new_port_name = port_name + "-" + str(instance_number)
+                    # change name in scripts
+                    if "script" in new_servers[new_server_name]:
+                        for script in new_servers[new_server_name]['script']:
+                            for script_name, script_value in script.items():
+                                if script_name == "target":
+                                    if script_value == server_name:
+                                        script['target'] = new_server_name
+                                    continue
+                                self.change_script_args(script_value,
+                                                        server_name, new_server_name,
+                                                        port_name, new_port_name)
+                    new_ports[new_port_name] = port_value
+                new_servers[new_server_name]['relations']['ports'] = new_ports
+                instance_number += 1
+        self.servers = new_servers
 
 #       convert script agruments to cloudify format
         for server_name, server_value in self.servers.items():
@@ -549,8 +548,12 @@ class ConverterNSDMTPYAML(object):
             server_yaml.set_nfvi_pop_id(server['NFVIPoPID'])
             server_yaml.set_ns_service_id(self.__ns_service_id)
             server_yaml.set_install_cloudify_agent(self.__install_cloudify_agent)
-            if server_name in self.__vnf_deployed_info_dict.keys():
-                db_agent_id = self.__vnf_deployed_info_dict[server_name]['agent_id']
+            if self.__install_rvm_agent == "yes":
+                if server_name in self.__vnf_deployed_info_dict.keys():
+                    db_agent_id = self.__vnf_deployed_info_dict[server_name]['agent_id']
+                else:
+                    db_agent_id = server_name
+
             else:
                 db_agent_id = None
             agent_id = server_yaml.set_install_rvm_agent(self.__install_rvm_agent, db_agent_id)
@@ -716,7 +719,7 @@ class Server(object):
                         "description": self.__name ,
                         "daemon_user": self.__user_image
                     }
-            agent_info = self.__create_rvm_agent(**body)
+            agent_info = self.create_rvm_agent(**body)
             if agent_info is None:
                 log_queue.put(
                     ["ERROR", "the Monitoring platform is not running or the connection configuration is wrong"])
@@ -784,7 +787,7 @@ class Server(object):
     def set_name(self, name):
         self.__name = name
 
-    def __create_rvm_agent(self,agent_id=None, install_method="", description="", daemon_user=""):
+    def create_rvm_agent(self, agent_id=None, install_method="", description="", daemon_user=""):
         """
         Contact with the monitoring manager to stop the requested exporter
         Parameters

@@ -22,7 +22,6 @@ from log import log
 
 upload_folder = path.realpath(path.join(path.dirname(path.realpath(__file__)), '../upload_packages'))
 
-
 # process to receive log messages from all processes and send them to the log
 def logger_process(log_queue):
 

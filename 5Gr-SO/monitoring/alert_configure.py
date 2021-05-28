@@ -16,12 +16,18 @@ File description
 """
 
 # python imports
-import traceback
-import time
 from http.client import HTTPConnection
 from six.moves.configparser import RawConfigParser
-import json
 from os import path, remove
+from zipfile import ZipFile
+import json
+import traceback
+import time
+import wget
+import os
+import sys
+import shutil
+import time
 
 # project imports
 from nbi import log_queue
@@ -52,10 +58,189 @@ spark_port = config.get("SPARK", "spark.port")
 spark_folder = path.realpath(path.join(path.dirname(path.realpath(__file__)), '../spark_streaming_jobs'))
 #log_queue.put(["DEBUG", "The spark parameters are: %s, %s, %s" % (spark_ip, spark_port, spark_folder)])
 
+#reading Forecasting Functional Block (ffb) properties
+config.read("../../monitoring/ffb.properties")
+ffb_platform_ip = config.get("FFB", "ffb.ip")
+ffb_platform_port = config.get("FFB", "ffb.port")
+ffb_platform_base_path = config.get("FFB", "ffb.base_path")
 
 ########################################################################################################################
 # PRIVATE METHODS                                                                                                      #
 ########################################################################################################################
+
+def get_model_aimlp (scope, nsdId):
+    """
+    Get the URL of the model to download from the AIML platform
+    Parameters
+    ----------
+    scope: string
+       The AIML problem tackled in this interaction with the AIML platform
+    nsdId: string
+        The nsdid of the instantiated network service
+    Returns
+    -------
+    streaming_class_name: string
+       The name of the streaming class to run the inference
+    model_name: string
+       The name of the model downloaded from the AIMLP
+    """
+
+    header = {'Accept': 'application/json',
+              'Content-Type': 'application/json'
+             }
+    aimlp_uri= "http://" + aiml_platform_ip + ":" + aiml_platform_port + aiml_platform_base_path + "/models"
+    aimlp_uri= aimlp_uri + "?" + "scope="+scope+"&"+"nsd_id="+nsdId
+    conn = HTTPConnection(aiml_platform_ip, aiml_platform_port)
+    model_url = None
+    model_info = None
+    while (model_url == None):
+        try:
+            conn.request("GET", aimlp_uri, None, headers=header)
+            rsp = conn.getresponse()
+            model_info = rsp.read()
+            model_info = model_info.decode("utf-8")
+            model_info = json.loads(model_info)
+            if (len(model_info) == 0):
+                log_queue.put(["DEBUG", "There is not a model"])
+                return None
+            model_url = model_info[0]["model_file_url"]            
+            # log_queue.put(["DEBUG", "Model Info from AIMLP is:"])
+            # log_queue.put(["DEBUG", model_info])
+        except ConnectionRefusedError:
+            # the AIMLP is not running or the connection configuration is wrong
+            #log_queue.put(["ERROR", "the AIMLP is not running or the connection configuration is wrong"])
+            log_queue.put(["DEBUG", "Error with the connection to the AIMLP connection"])
+        if (model_info[0]["status"] == "trained" and model_url == None):
+            # X seconds polling
+            time.sleep(10)        
+    model_url = "http://" + aiml_platform_ip + ":" + aiml_platform_port + model_url
+    conn.close()
+    # log_queue.put(["DEBUG", "Model url: %s" % model_url])
+    return model_url
+
+def aimlp_collector_put(kafka_topic, information):
+    """
+    Contacts with the 5Gr-AIMLP to inform about the created Kafka topic 
+    to start collecting info 
+    Parameters
+    ----------
+    kafka_topic: string
+       The name of the created Kafka topic to read from
+    information: dict
+       This dict contains information needed by the AIMLP to tune to the topic and
+       start collecting data for datasets (topicId, nsdId, kafka_info)
+    Returns
+    -------
+    response: string
+       "OK/KO" validating or not the operation at the AIMLP
+    """
+
+    header = {'Accept': 'application/json',
+              'Content-Type': 'application/json'
+             }
+    log_queue.put(["DEBUG", "Kafka topic is: %s and the information is: %s" % (kafka_topic, json.dumps(information))])
+    aimlp_uri = "http://" + aiml_platform_ip + ":" + aiml_platform_port + aiml_platform_base_path + "/dataset_collectors/"
+    aimlp_uri = aimlp_uri + kafka_topic
+    print(aimlp_uri)
+    conn = HTTPConnection(aiml_platform_ip, aiml_platform_port, timeout=10)
+    body = { "kafka_topic": kafka_topic,
+             "kafka_server": information["kafka_info"],
+             "nsd_id": information["nsd_id"]
+            }
+    conn.request('PUT', aimlp_uri, json.dumps(body), header)
+    rsp = conn.getresponse()
+    conn.close()
+    response= rsp.read()   
+    response = response.decode("utf-8")
+    response = json.loads(response)
+    #if rsp.status in [200, 201]:
+    #    log_queue.put(["DEBUG", "Everything OK: %s"% response])
+    return response
+
+def aimlp_collector_delete(kafka_topic):
+    """
+    Contacts with the 5Gr-AIMLP to delete the connection with the kafka topic 
+    and stop collecting info 
+    Parameters
+    ----------
+    kafka_topic: string
+       The name of the created Kafka topic to read from
+    Returns
+    -------
+    response: string
+       "OK/KO" validating or not the operation at the AIMLP
+    """
+
+    header = {'Accept': 'application/json',
+              'Content-Type': 'application/json'
+             }
+    aimlp_uri = "http://" + aiml_platform_ip + ":" + aiml_platform_port + aiml_platform_base_path + "/dataset_collectors/"
+    aimlp_uri = aimlp_uri + kafka_topic
+    conn = HTTPConnection(aiml_platform_ip, aiml_platform_port, timeout=10)
+    conn.request('DELETE', aimlp_uri, None, header)
+    rsp = conn.getresponse()
+    conn.close()
+    response= rsp.read()   
+    response = response.decode("utf-8")
+    response = json.loads(response)
+    #if rsp.status in [200, 201]:
+    #    log_queue.put(["DEBUG", "Everything OK: %s"% response])
+    return response 
+
+
+def get_model_streaming_names(scope, nsdId, spark_folder):
+    """
+    Get the names of the model and the streaming class for this service
+    Parameters
+    ----------
+    scope: string
+       The AIML problem tackled in this interaction with the AIML platform
+    nsdId: string
+        The nsdid of the instantiated network service
+    Returns
+    -------
+    streaming_class_name: string
+       The name of the streaming class to run the inference
+    model_file_name: string
+       The name of the model downloaded from the AIMLP
+    """
+    streaming_class_name = None
+    model_file_name = None
+    model_url = get_model_aimlp(scope,nsdId)
+    model_package = wget.download(model_url)
+    # log_queue.put(["INFO", "*****Time measure: SLAManager SLAManager downloaded files from 5Gr-AIMLPlatform"])
+    with ZipFile(model_package, 'r') as zip: 
+        # printing all the contents of the zip file 
+        size_zip = sum(zinfo.file_size for zinfo in zip.filelist)
+        zip_kb = float(size_zip) / 1000 #kB
+        # log_queue.put(["INFO", "*****Time measure: SLAManager SLAManager size of downloaded files from 5Gr-AIMLPlatform: %s" %zip_kb])
+        # zip.printdir() 
+        file_names= zip.namelist()
+        # extracting all the files 
+        zip.extractall() 
+    os.remove(model_package)    
+    # log_queue.put(["INFO", "*****Time measure: SLAManager SLAManager unzip files from 5Gr-AIMLPlatform"])
+    for file in file_names:
+        if (file.find(".jar") !=-1):
+            #this is the inference file
+            streaming_class_name = file
+            source = "./" + streaming_class_name
+            destination = spark_folder + "/" + streaming_class_name
+            os.rename(source, destination)
+        if (file.find(".zip") !=-1):
+            #this is the model_file
+            with ZipFile(file, 'r') as zip:
+                zip.extractall()    
+                # model_file_name = zip.namelist()[0]
+                model_file_name = zip.namelist()[0].split("/")[0]
+                source = "./" + model_file_name
+                destination = spark_folder + "/" + model_file_name
+                # in case it is available, we remove first the model folder
+                shutil.rmtree(destination, ignore_errors=True)
+                os.rename(source, destination)                
+            os.remove(file)
+    # log_queue.put(["INFO", "*****Time measure: SLAManager SLAManager move files to spark_streaming_jobs_folder"])            
+    return [streaming_class_name, model_file_name]
 
 def start_spark_streaming_job(nsId, kafka_topic, streaming_class, model_name, time_interval, kafka_ip, alert_target, status_file_location):
     """
@@ -248,8 +433,7 @@ def get_pm_alerts(nsd, deployed_vnfs_info, ns_id):
 
                 monitoring_job = monitoring_jobs[index_monitor_parameter]
                 # convert expression from IFA to PQL
-                alert_query = convert_expresion(performance_metric, monitoring_job['exporterId'], ns_id, monitoring_job['vnfdId'])
-
+                alert_query = convert_expresion(performance_metric, monitoring_job.get('exporterId', None), ns_id, monitoring_job['vnfdId'], "no")
 
                 # Creating summary query for request
                 if (idx_scaling_criterias == 0) and (len(scaling_criterias) == 1):
@@ -286,6 +470,7 @@ def get_pm_alerts(nsd, deployed_vnfs_info, ns_id):
             pm_alert['thresholdTime'] = auto_scaling_rule['ruleCondition']['thresholdTime']
             pm_alert['target'] = alert_target
             pm_alert['ruleActions'] = auto_scaling_rule['ruleActions']
+            pm_alert['type'] = monitoring_job['type']
             alerts.append(pm_alert)
     return alerts
 
@@ -298,12 +483,14 @@ def convert_relational_operation_from_nsd_to_monitoring_platform(operation):
     map_translation['LE'] = 'LEQ'
     map_translation['EQ'] = 'EQ'
     map_translation['NEQ'] = 'NEQ'
+    map_translation['match'] = 'match'
+    map_translation['not_match'] = 'not_match'
 
     monitoring_platform_operation = map_translation[operation]
 
     return monitoring_platform_operation
 
-def convert_expresion(performance_metric, job_id, ns_id, vnfd_id):
+def convert_expresion(performance_metric, job_id, ns_id, vnfd_id, forecasted):
     performance_metric_parts = performance_metric.split(".")
     try:
         return_expresion = expressions[(performance_metric_parts[0].lower())]
@@ -315,6 +502,8 @@ def convert_expresion(performance_metric, job_id, ns_id, vnfd_id):
     return_expresion = return_expresion.replace("{job_id}", 'job="' + str(job_id) + '"')
     return_expresion = return_expresion.replace("{nsId}", 'nsId="' + str(ns_id) + '"')
     return_expresion = return_expresion.replace("{vnfdId}", 'vnfdId="' + str(vnfd_id) + '"')
+    # ffb inclusion
+    # return_expresion = return_expresion.replace("{forecasted}", 'forecasted="' + str(forecasted) + '"')
     if performance_metric_parts[0] == "ByteIncoming":
         return_expresion = return_expresion.replace("{port}", 'device="' + str(performance_metric_parts[2]) + '"')
     return return_expresion
@@ -376,8 +565,9 @@ def get_alert(alert_id):
         log_queue.put(["ERROR", "the Config Manager is not running or the connection configuration is wrong"])
     return alert
 
-def create_alert(alert):
+def create_metric_alert(alert):
     """
+    Creates alert for metric
     Parameters
     ----------
     operationId: dict
@@ -407,6 +597,40 @@ def create_alert(alert):
         # the Config Manager is not running or the connection configuration is wrong
         log_queue.put(["ERROR", "the Config Manager is not running or the connection configuration is wrong"])
     return resp_alert
+
+def create_logs_alert(alert):
+    """
+    Creates alert for log
+    Parameters
+    ----------
+    operationId: dict
+        Object for creating
+    Returns
+    -------
+    name: type
+        return alert
+    """
+    header = {'Accept': 'application/json',
+              'Content-Type': 'application/json'
+              }
+    monitoring_uri = "http://" + monitoring_platform_ip + ":" + monitoring_platform_port + monitoring_platform_base_path + "/elk/alert"
+    try:
+        conn = HTTPConnection(monitoring_platform_ip, monitoring_platform_port)
+        conn.request("POST", monitoring_uri, body=json.dumps(alert), headers=header)
+        rsp = conn.getresponse()
+        resources = rsp.read()
+        resp_alert = resources.decode("utf-8")
+        log_queue.put(["DEBUG", "Logs Alert from Config Manager are:"])
+        log_queue.put(["DEBUG", resp_alert])
+        resp_alert = json.loads(resp_alert)
+        log_queue.put(["DEBUG", "Logs Alert from Config Manager are:"])
+        log_queue.put(["DEBUG", json.dumps(resp_alert, indent=4)])
+        conn.close()
+    except ConnectionRefusedError:
+        # the Config Manager is not running or the connection configuration is wrong
+        log_queue.put(["ERROR", "the Config Manager is not running or the connection configuration is wrong"])
+    return resp_alert
+
 
 def update_alert(alert):
     """
@@ -442,12 +666,13 @@ def update_alert(alert):
         log_queue.put(["ERROR", "the Config Manager is not running or the connection configuration is wrong"])
     return resp_alert
 
-def delete_alert(alert_id):
+def delete_metric_alert(alert_id):
     """
+
     Parameters
     ----------
-    operationId: dict
-        Object for creating
+    operationId: string
+        alert identifier
     Returns
     -------
     name: type
@@ -463,15 +688,47 @@ def delete_alert(alert_id):
         rsp = conn.getresponse()
         resources = rsp.read()
         resp_alert = resources.decode("utf-8")
-        log_queue.put(["DEBUG", "Alert from Config Manager are:"])
+        log_queue.put(["DEBUG", "Metric Alert from Config Manager are:"])
         log_queue.put(["DEBUG", resp_alert])
         resp_alert = json.loads(resp_alert)
-        log_queue.put(["DEBUG", "Alert from Config Manager are:"])
+        log_queue.put(["DEBUG", "Metric Alert from Config Manager are:"])
         log_queue.put(["DEBUG", json.dumps(resp_alert, indent=4)])
         conn.close()
     except ConnectionRefusedError:
         # the Config Manager is not running or the connection configuration is wrong
         log_queue.put(["ERROR", "the Config Manager is not running or the connection configuration is wrong"])
+
+def delete_log_alert(alert_id):
+    """
+    Parameters
+    ----------
+    operationId: string
+        alert identifier
+    Returns
+    -------
+    name: None
+
+    """
+    header = {'Accept': 'application/json'
+              }
+    monitoring_uri = "http://" + monitoring_platform_ip + ":" + monitoring_platform_port + monitoring_platform_base_path + "/elk/alert/" + str(
+        alert_id)
+    try:
+        conn = HTTPConnection(monitoring_platform_ip, monitoring_platform_port)
+        conn.request("DELETE", monitoring_uri, headers=header)
+        rsp = conn.getresponse()
+        resources = rsp.read()
+        resp_alert = resources.decode("utf-8")
+        log_queue.put(["DEBUG", "Log Alert from Config Manager are:"])
+        log_queue.put(["DEBUG", resp_alert])
+        resp_alert = json.loads(resp_alert)
+        log_queue.put(["DEBUG", "Log Alert from Config Manager are:"])
+        log_queue.put(["DEBUG", json.dumps(resp_alert, indent=4)])
+        conn.close()
+    except ConnectionRefusedError:
+        # the Config Manager is not running or the connection configuration is wrong
+        log_queue.put(["ERROR", "the Config Manager is not running or the connection configuration is wrong"])
+
 
 def configure_ns_alerts(nsId, nsdId, nsd, vnfds, deployed_vnfs_info):
     """
@@ -510,7 +767,14 @@ def configure_ns_alerts(nsId, nsdId, nsd, vnfds, deployed_vnfs_info):
                 'for': str(alert['thresholdTime']) + "s",
                 'target': alert['target']
             }
-            result_alert = create_alert(alert_request)
+
+            if alert['type'] == "logs":
+                alert_request['query'] = alert_request['value']
+                alert_request['index'] = nsId
+                del(alert_request['value'])
+                result_alert = create_logs_alert(alert_request)
+            else:
+                result_alert = create_metric_alert(alert_request)
             # send alert request
             alert_id = result_alert['alertId']
             alerts[alert_idx].update({'alertId': alert_id})
@@ -565,7 +829,11 @@ def configure_ns_aiml_scale_work(nsId, nsdId, nsd_json, vnfds_json, sap_info):
     if (aiml_scaling):    
         # 2 - create kafka topic
         problem = aiml_element["problem"]
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager asking scaling Kafka Topic" % (nsId)])
+  
         kafka_topic = monitoring.create_kafka_topic(nsId, problem)
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager created Kafka Topic" % (nsId)])
+
         log_queue.put(["DEBUG", "The created kafka_topic is: %s" % (kafka_topic)])
         if (kafka_topic):
             # 3 - make a call to config manager to create association between monitoring
@@ -581,15 +849,19 @@ def configure_ns_aiml_scale_work(nsId, nsdId, nsd_json, vnfds_json, sap_info):
                 scrapes_dict.update({scraper['scraperId']: scraper})
                 if (scrape_job["collectionPeriod"] > collectionPeriod):
                     collectionPeriod = scrape_job["collectionPeriod"]
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager created Scrapers at MON platform" % (nsId)])
+
             # 4 - download the model and the streaming class, save the files in the spark_folder
             # 4.1 - for the streaming class (jar file), we need a common folder and rename the file as class+kafka_topic, but for the model, 
             # 4.2 - we will create a new folder in the spark folder, called like the kafka_topic, for the moment static
-            # streaming_class = "5growth_polito_2.11-0.1.jar"
-            # model_name = "spark-random-forest-model"            
-            streaming_class = "5growth_vCDN_2.11-0.1.jar"
-            model_name = "spark-random-forest-model-vCDN"           
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager requesting Model/Streaming class at 5GR platform" % (nsId)])
+            [streaming_class, model_name] = get_model_streaming_names(aiml_element["problem"], nsdId, spark_folder)
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager downloaded Model/Streaming class at 5GR platform" % (nsId)])
+            log_queue.put(["INFO", "The obtained_streaming_class is: %s, the obtained_model_name is: %s" % (streaming_class, model_name)])
             status_file = spark_folder + "/" + kafka_topic + ".txt"            
-            log_queue.put(["DEBUG", "Status file: %s"%status_file])
+            # log_queue.put(["DEBUG", "Status file: %s"%status_file])
+            # log_queue.put(["INFO", "*****Time measure: SLAManager SLAManager model downloaded"])
+
             # 5 - start the spark job
             # spark_job_id = start_spark_streaming_job(nsId, kafka_topic, streaming_class, model_name)
             spark_job_id = start_spark_streaming_job(nsId, kafka_topic, streaming_class, model_name, collectionPeriod, \
@@ -597,17 +869,27 @@ def configure_ns_aiml_scale_work(nsId, nsdId, nsd_json, vnfds_json, sap_info):
             if (spark_job_id == None):
                 log_queue.put(["DEBUG", "Failure in the creation of the spark streaming job"])
                 return
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager created spark job" % (nsId)])
             log_queue.put(["DEBUG", "The created spark_job_id is: %s"% (spark_job_id)])
             # 6 - publish the currentIL in kafka topic
             currentIL = ns_db.get_ns_il(nsId)
-            current_IL = [{"type_message": "nsStatusMetrics",
-                             "metric": {
+            current_IL = {"metric": {
                                  "__name__": "nsInstantiationLevel",
-                                 "nsId": nsId,
+                                 "nsId": nsId
                              },
-                          "value": currentIL
-                          }]
-            monitoring.publish_json_kafka(kafka_topic, current_IL)         
+                          "value": currentIL,
+                          "type_message": "nsStatusMetrics"
+                          }
+            monitoring.publish_json_kafka(kafka_topic, current_IL)
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager initial posting of IL" % (nsId)])
+            # 6.1 - once the currentIL is published, the SLA manager warns the AIMLplatform so it can collect training information
+            information = dict()
+            information["kafka_topic"] = kafka_topic
+            information["kafka_info"] = str(kafka_ip) + ":" + str(kafka_port)
+            information["nsd_id"] = nsdId
+            response = aimlp_collector_put(kafka_topic, information)
+            # log_queue.put(["DEBUG", "The response is: %s"%response])
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager AIMLplatform-MON collecting training data" % (nsId)])
             # 7.1 - create the element to be saved in the database
             aiml_scale_dict["topicId"]= kafka_topic
             aiml_scale_dict["streamingClass"] = streaming_class
@@ -619,6 +901,7 @@ def configure_ns_aiml_scale_work(nsId, nsdId, nsd_json, vnfds_json, sap_info):
     # 7.2 - save the info in ns_db. Since there maybe other aiml job, we save this info as another element    
     # save the list of alerts in the database
     ns_db.set_aiml_info(nsId, "scaling", aiml_scale_dict)
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager saving AIML info in DB at instantiation" % (nsId)])
     
 def update_ns_aiml_scale_work(nsId, aiml_scaling_info):
     """
@@ -634,44 +917,67 @@ def update_ns_aiml_scale_work(nsId, aiml_scaling_info):
     -------
     """
     # steps:
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager starting update AIML scale work" % (nsId)])
     log_queue.put(["DEBUG", "Updating the AIML info after scaling for nsId: %s and info:"% nsId])
     log_queue.put(["DEBUG", json.dumps(aiml_scaling_info,indent=4)])
     kafka_topic = aiml_scaling_info["topicId"]
     streaming_class = aiml_scaling_info["streamingClass"]
     model_name = aiml_scaling_info["model"]
     collectionPeriod = aiml_scaling_info["collectionPeriod"]
+    # 0 - recreate the kafka topic 
+    kafka_parts = kafka_topic.split("_")    
+    kafka_element = monitoring.create_kafka_topic(kafka_parts[0], kafka_parts[1])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager re-created Kafka topic" % (nsId)])
     # 1 - restart spark job
     # spark_job_id = start_spark_streaming_job(nsId, kafka_topic, streaming_class, model_name)
     status_file = spark_folder + "/" + kafka_topic + ".txt"
     spark_job_id = start_spark_streaming_job(nsId, kafka_topic, streaming_class, model_name, \
                    collectionPeriod, kafka_ip + ":" + kafka_port, alert_target, status_file)
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager re-started Spark streaming job" % (nsId)])                 
+    if (spark_job_id == None):
+        log_queue.put(["DEBUG", "Failure in the creation of the spark streaming job"])
+        return
     aiml_scaling_info["streamingJobId"] = spark_job_id
     # 2 - publish the IL in the kafka topic
+    # time.sleep(10)
     currentIL = ns_db.get_ns_il(nsId)
-    #current_IL = { "key": "currentIL",
-    #               "value": currentIL}
-    current_IL = {"type_message": "nsStatusMetrics",
-                     "metric": {
+    log_queue.put(["DEBUG", "The new IL after scaling is: %s"%currentIL])
+    current_IL = {"metric": {
                          "__name__": "nsInstantiationLevel",
-                         "nsId": nsId,
+                         "nsId": nsId
                      },
-                  "value": currentIL
-                 }    
-    monitoring.publish_json_kafka(kafka_topic, currentIL)         
+                    "value": currentIL,
+                    "type_message": "nsStatusMetrics"
+                  }                       
+    monitoring.publish_json_kafka(kafka_topic, current_IL)  
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager re-posted current_IL" % (nsId)])
+    # 2.1 - update the IL to the forescasting jobs
+    # forecasting_jobs = ns_db.get_forecasting_info(nsId)
+    # for ffb_job in forecasting_jobs:
+    #    monitoring.update_forecasting_job(ffb_job["forecastId"], currentIL)
+    # log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager updated forecasting jobs with current_IL" % (nsId)])
     # 3 - update the db
     log_queue.put(["DEBUG","New scaling info: "])
     log_queue.put(["DEBUG", json.dumps(aiml_scaling_info, indent=4)])
     ns_db.set_aiml_info(nsId, "scaling", aiml_scaling_info)
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager updating AIML DB info after scaling" % (nsId)])
+
     
 def delete_ns_alerts(nsId):
     """
     """
     # parse NSD / VNFDs to get the list of alerts to be configured and its information
+    log_queue.put(["INFO", "*****Time measure: SLAManager SLAManager deleting alerts"])
     alerts = ns_db.get_alerts_info(nsId)
-    for alert in alerts:
-        delete_alert(alert)
+    for alert in alerts.values():
+        if alert['type'] == "logs":
+            delete_log_alert(alert['alertId'])
+        else:
+            delete_metric_alert(alert['alertId'])
     # delete monitor jobs from database by posting an empty list
     ns_db.set_alert_info(nsId, [])
+    log_queue.put(["INFO", "*****Time measure: SLAManager SLAManager deleted alert info in DB"])
+
 
 def delete_ns_aiml_scale_work(nsId):
     """
@@ -684,25 +990,34 @@ def delete_ns_aiml_scale_work(nsId):
     -------
     """
     # steps:
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager deleting AIML scale work"%nsId])
     aiml_scaling_info = ns_db.get_aiml_info(nsId, "scaling")
     log_queue.put(["DEBUG", "The info in aiml_scaling_info: "])
     log_queue.put(["DEBUG", json.dumps(aiml_scaling_info, indent=4)])
+    log_queue.put(["INFO", "*****Time measure: SLAManager SLAManager loaded AIML info"])
     if (aiml_scaling_info):
         kafka_topic = aiml_scaling_info["topicId"]
+        # 0 - delete the association AIMLP-VoMS
+        response = aimlp_collector_delete(kafka_topic)
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager removed connection AIMLP-MON" %nsId])
         # 1 - stop the spark job, in addition, remove the spark jar file from the repo
         delete_spark_streaming_job(aiml_scaling_info["streamingJobId"])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager deleted Spark job"%nsId])
         # 2 - delete the association between monitoring parameters and kafka topic
         prometheus_scrapers = aiml_scaling_info["scrapperJobs"]
         for scraper_id in prometheus_scrapers.keys():
             monitoring.delete_prometheus_scraper(scraper_id)
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager deleted scrapers"%nsId])
         # 3 - remove the Kafka Topic
         monitoring.delete_kafka_topic(aiml_scaling_info["topicId"])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager deleted Kafka topic"%nsId])
         # 4 - Remove the jar file and the folder model
         # 4.5 delete status file
         status_file = spark_folder + "/" + kafka_topic + ".txt"
         remove(status_file)
         # 5 - remove the info in ns_db
         ns_db.set_aiml_info(nsId, "scaling", {})
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: SLAManager SLAManager deleted AIML info in DB"%nsId])
 
 def get_performance_metric_for_aiml_rule(nsId, aiml_element, nsd_json):
     return_list = []
@@ -721,12 +1036,13 @@ def get_performance_metric_for_aiml_rule(nsId, aiml_element, nsd_json):
                 # }
                 # return_list.append(return_value)
             # print(param_ref)
+    #pre-ffb implementation
     panels_info = ns_db.get_dashboard_info(nsId)["panelsInfo"]
     for panel in panels_info:
         if (panel["monitoringParameterId"] in aiml_element["nsMonitoringParamRef"]):
             performance_metric = panel["performanceMetric"]
             metric, vnf  = panel["performanceMetric"].split(".")
-            expression = convert_expresion(performance_metric, None, nsId, vnf)
+            expression = convert_expresion(performance_metric, None, nsId, vnf, "no")
             return_value = {
                     "expression": expression,
                     "vnf": vnf,
@@ -734,6 +1050,41 @@ def get_performance_metric_for_aiml_rule(nsId, aiml_element, nsd_json):
                     "collectionPeriod": panel["collectionPeriod"]
                 }
             return_list.append(return_value)
-            print(panel["monitoringParameterId"])
+            # print(panel["monitoringParameterId"])
+    # ffb implementation: to check
+    # map_forecast_monitoring = dict()
+    # for elem in aiml_element:
+            # for aiml_param in elem["nsMonitoringParamRef"]:
+                # # first look in the forecasted info
+                # for f_param in nsd_json["nsd"]["forecastedInfo"]:
+                    # if (f_param["forecastingParameter"]["forecastingParameterId"] == aiml_param):
+                        # mon_param = f_param["forecastingParameter"]["monitoringParameterId"]
+                        # map_forecast_monitoring.update({mon_param:aiml_param})
+                        # break
+                # # second look in the monitored info
+                # for m_param in nsd_json["nsd"]["monitoredInfo"]:
+                    # if (m_param["monitoringParameter"]["monitoringParameterId"] == aiml_param):
+                        # mon_param = m_param["monitoringParameter"]["monitoringParameterId"]                   
+                        # map_forecast_monitoring.update({mon_param:aiml_param})
+                        # break
+    # panels_info = ns_db.get_dashboard_info(nsId)["panelsInfo"]
+    # for key in map_forecast_monitoring.keys():
+        # for panel in panels_info:
+            # if (key == panel["monitoringParameterId"]):
+                # # we are addressing the intended panel
+                # performance_metric = panel["performanceMetric"]
+                # metric, vnf  = panel["performanceMetric"].split(".")
+                # if (key == map_forecast_monitoring[key]):
+                    # expression = convert_expresion(performance_metric, None, nsId, vnf, "no")
+                # else:
+                    # expression = convert_expresion(performance_metric, None, nsId, vnf, "yes")            
+                # return_value = {
+                        # "expression": expression,
+                        # "vnf": vnf,
+                        # "metric": metric,
+                        # "collectionPeriod": panel["collectionPeriod"]
+                    # }
+                # return_list.append(return_value)
+                # break
     return return_list
 

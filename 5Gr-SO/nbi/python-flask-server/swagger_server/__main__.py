@@ -31,14 +31,17 @@ from db.ns_db import ns_db
 from db.nsd_db import nsd_db
 from db.vnfd_db import vnfd_db
 from db.appd_db import appd_db
+from db.pnfd_db import pnfd_db
 from db.operation_db import operation_db
 from db.nsir_db import nsir_db
 from db.user_db import user_db
+from db.notification_db import notification_db
 from sbi import sbi
 from nbi import log_queue
 from login_module.server_login import login_passed
 
 from monitoring.webhook_receiver_alertmanager_sla import SLAManagerAPI
+import swagger_server.webserver_utils
 
 so_port = 8080
 logger = getLogger("5gtso")
@@ -52,6 +55,11 @@ config_provider_domains_file = path.realpath(path.join(path.dirname(path.realpat
 local_swagger_ui_path = path.join(path.dirname(path.realpath(__file__)), 'swagger-ui-cttc')
 options = {'swagger_path': local_swagger_ui_path}
 app = connexion.App(__name__, specification_dir="./swagger/", options=options)
+
+
+@app.app.context_processor
+def inject_notification():
+    return dict(notification=notification_db.get_all_notifications())
 
 
 @app.route('/register', methods=['GET', 'POST'])
@@ -196,7 +204,8 @@ def collections(table_name):
     :param table_name: string
     :return:        the rendered template 'tables.html'
     """
-    if table_name not in ['ns', 'nsd', 'nsir', 'operation', 'resources', 'vnfd', 'user']:
+    #if table_name not in ['ns', 'nsd', 'nsir', 'operation', 'resources', 'vnfd', 'user']:
+    if table_name not in ['ns', 'nsd', 'nsir', 'operation', 'resources', 'vnfd', 'user', 'pnfd']:
         abort(404)
     users = user_db.get_all_user()
     vnfds = vnfd_db.get_all_vnfd()
@@ -204,6 +213,7 @@ def collections(table_name):
     nss = ns_db.get_all_ns()
     nsirs = nsir_db.get_all_nsir()
     operations = operation_db.get_all_operation()
+    pnfds = pnfd_db.get_all_pnfd()
     return render_template('tables.html', html_title='Databases',
                            list_users=users,
                            list_vnfds=vnfds,
@@ -211,6 +221,7 @@ def collections(table_name):
                            list_nss=nss,
                            list_nsirs=nsirs,
                            list_operations=operations,
+                           list_pnfds=pnfds,
                            table_name=table_name)
 
 
@@ -236,6 +247,17 @@ def delete_element():
         log_queue.put(["INFO", message['Success']])
         flash(message['Success'], 'success')
         return redirect(request.referrer)
+
+
+@app.route('/clear_notifications', methods=['GET'])
+@login_passed
+def clear_notifications():
+    """
+    This function will clear the notifications
+    :return:   redirect to the previous page
+    """
+    notification_db.empty_notification_collection()
+    return redirect(request.referrer)
 
 
 @app.route('/modify_element', methods=['POST'])

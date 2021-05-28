@@ -107,6 +107,29 @@ def get_operationId(nsId, operation_type):
         Identifier of the operation.
     """
     operation = operation_coll.find_one({"nsId": nsId, "operation_type": operation_type})
+    if operation is not None:
+        return operation["operationId"]
+    else:
+        return None
+
+def get_operationIdcomplete(nsId, operation_type, status):
+    """
+    Function to get the operation identifier corresponding to the Network Service Instance identified by nsId and with
+    operation_type.
+    Parameters
+    ----------
+    nsId: string
+        Identifier of the Network Service Instance.
+    operation_type: string
+        Type of operation.
+    status: string
+        Status of the operation
+    Returns
+    -------
+    string
+        Identifier of the operation.
+    """
+    operation = operation_coll.find_one({"nsId": nsId, "operation_type": operation_type, "status": status})
     return operation["operationId"]
 
 

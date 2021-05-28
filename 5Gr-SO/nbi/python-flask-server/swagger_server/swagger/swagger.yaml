@@ -1,15 +1,15 @@
 ---
 swagger: "2.0"
 info:
-  description: "REST-API server for the North Bound Interface of the 5GT-SO. Find\
-    \ more at http://5g-transformer.eu"
+  description: "REST-API server for the North Bound Interface of the 5Growth-SO. Find\
+    \ more at http://5growth.eu"
   version: "1.0"
-  title: "5GT-SO NBI"
+  title: "5Growth-SO NBI"
 host: "localhost:8080"
 basePath: "/5gt/so/v1"
 tags:
-- name: "5GT-SO NBI"
-  description: "access to 5GT-SO"
+- name: "5Growth-SO NBI"
+  description: "access to 5Growth-SO"
 schemes:
 - "http"
 paths:
@@ -178,11 +178,31 @@ paths:
           schema:
             $ref: "#/definitions/inline_response_200"
       x-swagger-router-controller: "swagger_server.controllers.network_service_controller"
+  /ns/nsd:
+    get:
+      tags:
+      - "network service"
+      summary: "Returns information of all NSDs onboarded in the SO"
+      description: ""
+      operationId: "query_nsds"
+      produces:
+      - "application/json"
+      parameters: []
+      responses:
+        200:
+          description: "Successful Operation"
+          schema:
+            type: "object"
+        404:
+          description: "Not Found"
+        500:
+          description: "Internal Error"
+      x-swagger-router-controller: "swagger_server.controllers.network_service_controller"
   /ns/nsd/{nsdId}/{version}:
     get:
       tags:
       - "network service"
-      summary: "Returns information of the network service referenced by nsId"
+      summary: "Returns information of the network service referenced by nsdId"
       description: ""
       operationId: "query_nsd"
       produces:
@@ -234,6 +254,26 @@ paths:
           description: "Successful Operation"
           schema:
             $ref: "#/definitions/inline_response_201"
+        404:
+          description: "Not Found"
+        500:
+          description: "Internal Error"
+      x-swagger-router-controller: "swagger_server.controllers.network_service_controller"
+  /ns/vnfd:
+    get:
+      tags:
+      - "network service"
+      summary: "Returns information of all VNFDs onboarded in the SO"
+      description: ""
+      operationId: "query_vnfds"
+      produces:
+      - "application/json"
+      parameters: []
+      responses:
+        200:
+          description: "Successful Operation"
+          schema:
+            type: "object"
         404:
           description: "Not Found"
         500:
@@ -358,6 +398,68 @@ paths:
         500:
           description: "Internal Error"
       x-swagger-router-controller: "swagger_server.controllers.network_service_controller"
+  /ns/pnfd/{pnfdId}/{version}:
+    get:
+      tags:
+      - "network service"
+      summary: "Returns information of the Physical Network Function (PNF) referenced\
+        \ by pnfdId"
+      description: ""
+      operationId: "query_pnfd"
+      produces:
+      - "application/json"
+      parameters:
+      - name: "pnfdId"
+        in: "path"
+        description: "ID of the physical network function descriptor"
+        required: true
+        type: "string"
+      - name: "version"
+        in: "path"
+        description: "Version of the physical network function descriptor"
+        required: true
+        type: "string"
+      responses:
+        200:
+          description: "Successful Operation"
+          schema:
+            type: "object"
+        404:
+          description: "Not Found"
+        500:
+          description: "Internal Error"
+      x-swagger-router-controller: "swagger_server.controllers.network_service_controller"
+    delete:
+      tags:
+      - "network service"
+      summary: "Delete the onboarded physical network function referenced by pnfdId"
+      description: ""
+      operationId: "delete_pnfd"
+      consumes:
+      - "application/json"
+      produces:
+      - "application/json"
+      parameters:
+      - name: "pnfdId"
+        in: "path"
+        description: "ID of the physical network function descriptor"
+        required: true
+        type: "string"
+      - name: "version"
+        in: "path"
+        description: "Version of the physical network function descriptor"
+        required: true
+        type: "string"
+      responses:
+        200:
+          description: "Successful Operation"
+          schema:
+            type: "object"
+        404:
+          description: "Not Found"
+        500:
+          description: "Internal Error"
+      x-swagger-router-controller: "swagger_server.controllers.network_service_controller"
   /ns/vnfdManagement/vnfPackage:
     post:
       tags:
@@ -441,6 +543,36 @@ paths:
           description: "Successful Operation"
           schema:
             $ref: "#/definitions/NsOnboardingReply"
+        400:
+          description: "Bad Request"
+        404:
+          description: "Not Found"
+        500:
+          description: "Internal Error"
+      x-swagger-router-controller: "swagger_server.controllers.network_service_controller"
+  /ns/pnfdManagement/pnfd:
+    post:
+      tags:
+      - "network service"
+      summary: "Returns information of the onboarded physical network function"
+      description: ""
+      operationId: "onboard_pnfd"
+      consumes:
+      - "application/json"
+      produces:
+      - "application/json"
+      parameters:
+      - in: "body"
+        name: "body"
+        description: "The PNFD descriptor"
+        required: true
+        schema:
+          type: "object"
+      responses:
+        200:
+          description: "Successful Operation"
+          schema:
+            $ref: "#/definitions/PnfOnboardingReply"
         400:
           description: "Bad Request"
         404:
@@ -778,6 +910,15 @@ definitions:
         type: "boolean"
       scope:
         type: "string"
+  PnfOnboardingReply:
+    type: "object"
+    required:
+    - "pnfdInfoId"
+    properties:
+      pnfdInfoId:
+        type: "string"
+    example:
+      pnfdInfoId: "pEPC"
   NsOnboardingReply:
     type: "object"
     required:
@@ -959,5 +1100,5 @@ definitions:
       description: "description"
       address: "10.10.10.10"
 externalDocs:
-  description: "Find out more about 5G-Transformer"
-  url: "http://5g-transformer.eu/"
+  description: "Find out more about 5Growth"
+  url: "http://5growth.eu/"

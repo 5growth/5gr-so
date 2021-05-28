@@ -1,0 +1,154 @@
+{
+  "nsd": {
+  "nsdIdentifier" : "DT_aiml_NS",
+  "designer" : "CTTC-UC3M-Polito",
+  "version" : "0.1",
+  "nsdName" : "Digital Twin",
+  "nsdInvariantId" : "DT_aiml_NS_0.1",
+  "vnfdId" : [ "DTApp_VNF", "ControlApp_VNF" ],
+  "sapd" : [ {
+    "cpdId" : "mgt_sap",
+    "layerProtocol" : "IPV4",
+    "description" : "Management and data SAP",
+    "addressData" : [ {
+      "addressType" : "IP_ADDRESS",
+      "iPAddressAssignment" : false,
+      "floatingIpActivated" : true,
+      "management" : true,
+      "iPAddressType" : "IPv4",
+      "numberOfIpAddress" : 1
+    } ],
+    "sapAddressAssignment" : false,
+    "nsVirtualLinkDescId" : "mgt_app_vl"
+  }],
+  "virtualLinkDesc" : [ {
+    "virtualLinkDescId" : "mgt_app_vl",
+    "virtualLinkDescProvider" : "Nextworks",
+    "virtuaLinkDescVersion" : "0.1",
+    "connectivityType" : {
+      "layerProtocol" : "IPV4",
+      "flowPattern" : null
+    },
+    "virtualLinkDf" : [ {
+      "flavourId" : "mgt_app_vl_vldf",
+      "qos" : {
+        "latency" : 20,
+        "packetDelayVariation" : 0,
+        "packetLossRatio" : 0,
+        "priority" : 0
+      },
+      "serviceAvaibilityLevel" : "LEVEL_1",
+      "bitrateRequirements": {
+	      "root": 2,
+	      "leaf": 2
+      }
+    } ],
+    "description" : "mgt vLink"
+  }],
+  "nsDf" : [ {
+    "nsDfId" : "DT_aiml_df",
+    "flavourKey" : "DT_aiml_df_df",
+    "vnfProfile" : [ {
+      "vnfProfileId" : "ControlApp_VNF_profile",
+      "vnfdId" : "ControlApp_VNF",
+      "flavourId" : "ControlApp_VNF_df",
+      "instantiationLevel" : "il_ControlApp",
+      "minNumberOfInstances" : 1,
+      "maxNumberOfInstances" : 1,
+      "nsVirtualLinkConnectivity" : [ {
+        "virtualLinkProfileId" : "mgt_app_vl_profile",
+        "cpdId" : [ "control_app_mgt_extcp" ]
+      } ]
+    }, {
+      "vnfProfileId" : "DTApp_VNF_profile",
+      "vnfdId" : "DTApp_VNF",
+      "flavourId" : "DTApp_VNF_df",
+      "instantiationLevel" : "il_DTApp",
+      "minNumberOfInstances" : 1,
+      "maxNumberOfInstances" : 1,
+      "nsVirtualLinkConnectivity" : [ {
+        "virtualLinkProfileId" : "mgt_app_vl_profile",
+        "cpdId" : [ "dtapp_mgt_extcp" ]
+      }]
+    }],
+    "virtualLinkProfile" : [ {
+      "virtualLinkProfileId" : "mgt_app_vl_profile",
+      "virtualLinkDescId" : "mgt_app_vl",
+      "flavourId" : "mgt_app_vl_vldf",
+      "maxBitrateRequirements" : {
+        "root" : "1",
+        "leaf" : "1"
+      },
+      "minBitrateRequirements" : {
+        "root" : "1",
+        "leaf" : "1"
+      }
+    }],
+    "nsInstantiationLevel" : [ {
+      "nsLevelId" : "DT_aiml_il_small",
+      "description" : "Digital Twin small instantiation level",
+      "vnfToLevelMapping" : [ {
+        "vnfProfileId" : "ControlApp_VNF_profile",
+        "numberOfInstances" : 1
+      }, {
+        "vnfProfileId" : "DTApp_VNF_profile",
+        "numberOfInstances" : 1
+      } ],
+      "virtualLinkToLevelMapping": [ {
+        "virtualLinkProfileId": "mgt_app_vl_profile",
+      	"bitRateRequirements": {
+      	   "root": "1",
+      	   "leaf": "1"
+      	   }
+      	}]
+    },
+    {
+      "nsLevelId" : "DT_aiml_il_big",
+      "description" : "Digital Twin big instantiation level",
+      "vnfToLevelMapping" : [ {
+        "vnfProfileId" : "ControlApp_VNF_profile",
+        "numberOfInstances" : 2
+      }, {
+        "vnfProfileId" : "DTApp_VNF_profile",
+        "numberOfInstances" : 1
+      } ],
+      "virtualLinkToLevelMapping": [ {
+        "virtualLinkProfileId": "mgt_app_vl_profile",
+      	"bitRateRequirements": {
+      	   "root": "1",
+      	   "leaf": "1"
+      	   }
+      	}]	
+    } ],
+    "defaultNsInstantiationLevelId" : "DT_aiml_il_small",
+	"nsProfile": [{
+		"nsProfileId": "ns_profile_DT_aiml_big",
+		"nsdId": "DT_aiml_NS",
+		"nsDfId": "DT_aiml_df",
+		"nsInstantiationLevelId": "DT_aiml_il_big",
+		"minNumberOfInstances": 1,
+		"maxNumberOfInstances": 1
+		},
+		{
+		"nsProfileId": "ns_profile_DT_aiml_small",
+		"nsdId": "DT_aiml_NS",
+		"nsDfId": "DT_aiml_df",
+		"nsInstantiationLevelId": "DT_aiml_il_small",
+		"minNumberOfInstances": 1,
+		"maxNumberOfInstances": 1
+	}]
+  } ],
+ 	"monitoredInfo": [{
+  "monitoringParameter": {
+		"monitoringParameterId": "mp1",
+	    "name": "ControlAppLoad",
+		"performanceMetric": "VcpuUsageMean.ControlApp_VNF"
+		}
+	}],
+  "security" : {
+    "signature" : "SIGNATURE",
+    "algorithm" : "ALGORITHM",
+    "certificate" : "CERTIFICATE"
+  }	
+}
+}

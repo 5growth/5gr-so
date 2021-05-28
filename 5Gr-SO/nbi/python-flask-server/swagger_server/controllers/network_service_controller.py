@@ -1,4 +1,4 @@
-# Copyright 2019 CTTC www.cttc.es
+# Copyright 2020 CTTC www.cttc.es
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -20,6 +20,8 @@ This file contains the methods used by the /ns path of the NBI (network service)
 import connexion
 import six
 from json import dumps, loads, load
+from datetime import datetime
+import pytz
 
 # swagger imports
 from swagger_server.models.app_onboarding_reply import AppOnboardingReply  # noqa: E501
@@ -31,10 +33,13 @@ from swagger_server.models.ns_info import NsInfo  # noqa: E501
 from swagger_server.models.ns_instantiation_request import NsInstantiationRequest  # noqa: E501
 from swagger_server.models.ns_onboarding_reply import NsOnboardingReply  # noqa: E501
 from swagger_server.models.ns_scale_request import NsScaleRequest  # noqa: E501
+from swagger_server.models.pnf_onboarding_reply import PnfOnboardingReply  # noqa: E501
 from swagger_server.models.vnf_onboarding_reply import VnfOnboardingReply  # noqa: E501
 from swagger_server.models.vnf_onboarding_request import VnfOnboardingRequest  # noqa: E501
 from swagger_server import util
 from swagger_server.models.http_errors import error400, error404
+# importing notifications
+from db.notification_db import notification_db
 
 # project imports
 import sm.soe.soe as soe
@@ -54,13 +59,17 @@ def create_ns_identifier(body):  # noqa: E501
 
     :rtype: InlineResponse201
     """
-    log_queue.put(["INFO", "*****Time measure: NBI creation of ns_identifier"])
+    current_time = datetime.now(pytz.utc)
+    log_queue.put(["INFO", "*****Time measure: NBI NBI creation of ns_identifier"])
     if connexion.request.is_json:
         body = CreateNsIdentifierRequest.from_dict(connexion.request.get_json())  # noqa: E501
     nsId = soep.create_ns_identifier(body)
     if nsId == 404:
         return error404("nsdId not found")
-    log_queue.put(["INFO", "*****Time measure: NBI returning operation ID instantiating ns at SM"])
+    current_time2 = datetime.now(pytz.utc)
+    timeout = current_time2-current_time
+    #log_queue.put(["INFO", "*****Time measure for nsId %s : NBI returning nsID instantiating ns at SM" % (nsId)])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s with nsdId: %s: NBI NBI time to create nsID at SM: %s " % (nsId, body.nsd_id, timeout)])
     # TODO: debug, in return the 201 should not be needed but if it is missing the REST API returns a 200
 
     return {"nsId": nsId}, 201
@@ -100,6 +109,23 @@ def delete_nsd(nsdId, version):  # noqa: E501
     else:
         return error404("nsdId not found")
 
+def delete_pnfd(pnfdId, version):  # noqa: E501
+    """Delete the onboarded physical network function referenced by pnfdId
+
+     # noqa: E501
+
+    :param pnfdId: ID of the physical network function descriptor
+    :type pnfdId: str
+    :param version: Version of the physical network function descriptor
+    :type version: str
+
+    :rtype: object
+    """
+    if soe.delete_pnfd(pnfdId, version):
+        return {"deletedPnfdInfoId": pnfdId}
+    else:
+        return error404("pnfdId not found")    
+
 
 def delete_vnfd(vnfdId, version):  # noqa: E501
     """Deletes the specified virtual network function
@@ -130,7 +156,14 @@ def instantiate_ns(nsId, body):  # noqa: E501
 
     :rtype: InlineResponse200
     """
-    log_queue.put(["INFO", "*****Time measure: NBI starting instantiating ns at SM"])
+    notification_db.create_notification_record({
+        "nsId": nsId,
+        "type": "fa-send-o",
+        "text": "INSTANTIATION Request for " + nsId,
+        "time": datetime.now().strftime("%d/%m/%Y %H:%M:%S.%f")
+      })
+
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: NBI NBI starting instantiating ns at SM" % (nsId)])
     if connexion.request.is_json:
         body = NsInstantiationRequest.from_dict(connexion.request.get_json())  # noqa: E501
     requester = connexion.request.remote_addr
@@ -140,7 +173,7 @@ def instantiate_ns(nsId, body):  # noqa: E501
         return error400("network service is not in NOT_INSTANTIATED state")
     if operationId == 404:
         return error404("nsId not found, not a valid requester or nestedInstanceId cannot be shared")
-    log_queue.put(["INFO", "*****Time measure: NBI returning operation ID instantiating ns at SM"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: NBI NBI returning operation ID instantiating ns at SM" % (nsId)])
     return {"operationId": operationId}
 
 def onboard_appd(body):  # noqa: E501
@@ -177,6 +210,26 @@ def onboard_nsd(body):  # noqa: E501
     info = {"nsdInfoId": nsdInfoId}        
     return info
 
+def onboard_pnfd(body):  # noqa: E501
+    """Returns information of the onboarded physical network function
+
+     # noqa: E501
+
+    :param body: The PNFD descriptor
+    :type body: 
+
+    :rtype: PnfOnboardingReply
+    """
+    if connexion.request.is_json:
+        pnfd_json = connexion.request.get_json()
+    # requester = connexion.request.remote_addr
+    pnfdInfoId = soe.onboard_pnfd(pnfd_json)
+    if pnfdInfoId == 404:
+        return error404("Physical Network function has not been onboarded in the catalog")
+    info = {"pnfdInfoId": pnfdInfoId}        
+    return info
+
+
 def onboard_vnfd(body):  # noqa: E501
     """Returns information of the onboarded virtual network function
 
@@ -209,6 +262,29 @@ def query_ns(nsId):  # noqa: E501
 
     return {"queryNsResult": [info]}
 
+def query_nsds():  # noqa: E501
+    """Returns information of all NSDs onboarded in the SO
+
+     # noqa: E501
+
+
+    :rtype: object
+    """
+    nsds = soep.query_nsds()
+    nsds_info = []
+    for nsd in nsds:
+       nsd_info = nsd
+       nsd_info["nsdId"] = nsd["nsd"]["nsdIdentifier"]
+       nsd_info["name"] = nsd["nsd"]["nsdName"]
+       nsd_info["designer"] = nsd["nsd"]["designer"]
+       nsd_info["version"] = nsd["nsd"]["version"]
+       nsd_info["operationalState"] = "ENABLED"
+       nsd_info["usageState"] = "NOT_IN_USE"
+       nsd_info["deletionPending"] = False
+       nsd_info["userDefinedData"] = {}
+       nsds_info.append(nsd_info)
+    total_return = {"queryResult": nsds_info}
+    return total_return
 
 def query_nsd(nsdId, version):  # noqa: E501
     """Returns information of the network service referenced by nsId
@@ -239,6 +315,60 @@ def query_nsd(nsdId, version):  # noqa: E501
 
     return total_return
 
+def query_pnfd(pnfdId, version):  # noqa: E501
+    """Returns information of the Physical Network Function (PNF) referenced by pnfdId
+
+     # noqa: E501
+
+    :param pnfdId: ID of the physical network function descriptor
+    :type pnfdId: str
+    :param version: Version of the physical network function descriptor
+    :type version: str
+
+    :rtype: object
+    """
+    pnfd = soe.query_pnfd(pnfdId, version)
+
+    if pnfd == 404:
+        return error404("pnfdId/version not found")
+    
+    pnfd["pnfdId"] = pnfd["pnfd"]["pnfdId"]
+    pnfd["name"] = pnfd["pnfd"]["name"]
+    pnfd["version"] = pnfd["pnfd"]["version"]
+    pnfd["provider"] = pnfd["pnfd"]["provider"]
+    pnfd["usageState"] = "NOT_IN_USE"
+    pnfd["deletionPending"] = False
+    pnfd["userDefinedData"] = {}
+    total_return = {"queryResult": [pnfd]}
+
+    return total_return
+
+def query_vnfds():  # noqa: E501
+    """Returns information of all VNFDs onboarded in the SO
+
+     # noqa: E501
+
+
+    :rtype: object
+    """
+    vnfds = soep.query_vnfds()
+    vnfds_info = []
+    for vnfd in vnfds:
+        vnfd = {"vnfd": vnfd}
+        vnfd["vnfdId"] = vnfd["vnfd"]["vnfdId"]
+        vnfd["vnfProvider"] = vnfd["vnfd"]["vnfProvider"]
+        vnfd["vnfProductName"] = vnfd["vnfd"]["vnfProductName"]
+        vnfd["vnfSoftwareVersion"] = vnfd["vnfd"]["vnfSoftwareVersion"]
+        vnfd["vnfdVersion"] = vnfd["vnfd"]["vnfdVersion"]
+        vnfd["checksum"] = "TEST CHECKSUM"
+        vnfd["softwareImage"] = []
+        vnfd["operationalState"] = "ENABLED"
+        vnfd["usageState"] = "NOT_IN_USE"
+        vnfd["deletionPending"] = False
+        vnfds_info.append(vnfd)
+    total_return = {"queryResult": vnfds_info}
+    return total_return
+    return 'do some magic!'
 
 def query_vnfd(vnfdId, version):  # noqa: E501
     """Returns information of the virtual network function referenced by vnfId
@@ -311,15 +441,24 @@ def scale_ns(nsId, body):  # noqa: E501
 
     :rtype: InlineResponse200
     """
+    notification_db.create_notification_record({
+        "nsId": nsId,
+        "type": "fa-gears",
+        "text": "SCALING Request for " + nsId,
+        "time": datetime.now().strftime("%d/%m/%Y %H:%M:%S.%f")
+      })    
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: NBI NBI starting scaling ns at SM" % nsId])
     if connexion.request.is_json:
         body = NsScaleRequest.from_dict(connexion.request.get_json())  # noqa: E501
     # SCALING is done with 
-    operationId = soep.scale_ns(nsId, body)
+    requester = connexion.request.remote_addr
+    operationId = soep.scale_ns(nsId, body, requester)
     # process errors
     if operationId == 400:
         return error400("network service is not in NOT_INSTANTIATED state")
     if operationId == 404:
         return error404("nsId not found or network service cannot be scaled")
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: NBI NBI returning operation ID scaling ns at SM" %nsId])
     return {"operationId": operationId}
 
 
@@ -334,12 +473,18 @@ def terminate_ns(nsId):  # noqa: E501
 
     :rtype: InlineResponse200
     """
-    log_queue.put(["INFO", "*****Time measure: NBI starting termination ns at SM"])
+    notification_db.create_notification_record({
+        "nsId": nsId,
+        "type": "fa-trash-o",
+        "text": "TERMINATION Request for " + nsId,
+        "time": datetime.now().strftime("%d/%m/%Y %H:%M:%S.%f")
+      })
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: NBI NBI starting termination ns at SM" % (nsId)])
     requester = connexion.request.remote_addr   
     operationId = soep.terminate_ns(nsId, requester)
     if operationId == 400:
         return error400("network service is not in INSTANTIATED or INSTANTIATING state")
     if operationId == 404:
         return error404("nsId not found or the requester has not authorization to perform this operation")
-    log_queue.put(["INFO", "*****Time measure: NBI returning operation ID termination ns at SM"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: NBI NBI returning operation ID termination ns at SM" % (nsId)])
     return {"operationId": operationId}

@@ -39,6 +39,42 @@
         </div>
         <!-- /.navbar-header -->
         <ul class="nav navbar-top-links navbar-right">
+		
+            <li class="dropdown open" id="notify">
+                <a class="dropdown-toggle" data-toggle="dropdown" href="#" aria-expanded="True">
+                    <em class="fa fa-bell fa-fw"></em>
+                    {% if notification %}
+                        <span class="label label-danger">{{ notification|length }}</span>
+                    {% endif %}
+                </a>
+                <ul class="dropdown-menu dropdown-alerts">
+                    {% for notify in notification %}
+                    <li>
+                        <a href="#">
+                            <div>
+                                <i class="fa {{ notify.type }} fa-fw"></i> {{ notify.text }}
+                                <span class="pull-right text-muted small">{{ notify.time }}</span>
+                            </div>
+                        </a>
+                    </li>
+                    <li class="divider"></li>
+                    {% endfor %}
+                    <li>
+                        <a class="text-center" href="#">
+                            <strong>LCM operations</strong>
+                            <!-- <i class="fa fa-angle-right"></i> -->
+                        </a>
+                    </li>
+                    <li>
+                        <a class="text-center" href="/clear_notifications">
+                            <strong>Clear all notifications</strong>
+                             <i class="fa fa-angle-right"></i>
+                        </a>
+                    </li>
+                </ul>
+                <!-- /.dropdown-alerts -->
+            </li>		
+		
             {% if session['logged_in'] %}
             <li class="dropdown">
                 <a class="dropdown-toggle" data-toggle="dropdown" href="#">
@@ -102,6 +138,9 @@
                             <!--<li>
                                 <a href="/databases/resources"> Resources</a>
                             </li>-->
+                            <li>
+                                <a href="/databases/pnfd"> PNFD</a>
+                            </li>							
                             <li>
                                 <a href="/databases/vnfd"> VNFD</a>
                             </li>
@@ -175,6 +214,11 @@ $(function () {
 $(".alert").fadeTo(2500, 500).slideUp(500, function(){
     $(this).remove();
 });
+
+setInterval("refresh_notifications();",15000);
+function refresh_notifications(){
+  $('#notify').load(location.href + ' #notify>*');
+}
 </script>
 
 <!-- jQuery -->

@@ -145,7 +145,7 @@ def simple_lsa (info_links, resources, nested_connections):
     # represent the link
     gw_info = {}
     required_logical_links=[]
-
+    # log_queue.put(["DEBUG", "In SIMPLELSA info links: %s"%info_links])
     for pop in resources["NfviPops"]:
         # this is a federated vim
         if "federatedVimId" in pop["nfviPopAttributes"]:
@@ -174,6 +174,7 @@ def simple_lsa (info_links, resources, nested_connections):
                 for ll in resources["logicalLinkInterNfviPops"]:
                     if (ll["logicalLinks"]["logicalLinkId"] == elem):
                         if (ll["logicalLinks"]["availableBandwidth"] < min_bw):
+                            # in case of tie, select the link with the minimum available bw to fill it
                             min_bw = ll["logicalLinks"]["availableBandwidth"]
                             selected_ll = elem
                             delay = ll["logicalLinks"]["networkQoS"]["linkDelayValue"]
@@ -184,8 +185,9 @@ def simple_lsa (info_links, resources, nested_connections):
                          "dstMac": nested_connections[connections]["pairs"][pair][1][2],
                          "ll_id": selected_ll, 
                          "network_name": nested_connections[connections]["network"],
-                         "bw": min_bw,
-                         "latency": delay}              
+                         "bw": int(bw),
+                         "latency": int(latency)}              
+                         
             if "vlanId" in nested_connections[connections]:
                 link_attr.update({"vlanId": nested_connections[connections]["vlanId"]})
             required_logical_links.append(link_attr)   
@@ -304,7 +306,7 @@ def get_federated_network_info_reply(nsId, nsdId, domain):
     networkInfo: dict
         return the information about used pools and IP addresses for the internested services
     """
-    log_queue.put(["INFO", "*****Time measure: CROOE CROOE starts replying to get_federated_network_info"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE starts replying to get_federated_network_info" % (nsId)])
     networkInfo = {}
     # first check, check if the nsdId request coincides with the domain of the descriptor
     nested_domain_json = nsd_db.get_nsd_domain(nsdId)
@@ -325,7 +327,7 @@ def get_federated_network_info_reply(nsId, nsdId, domain):
     network_mapping = network_mapping["nestedVirtualLinkConnectivity"][nsdId] 
     for elem in network_mapping:
          key = next(iter(elem))
-         log_queue.put(["DEBUG", "network is: %s"%key])
+         # log_queue.put(["DEBUG", "network is: %s"%key])
          networkInfo["cidr"][key] = ""
          networkInfo["addressPool"][key] = [] 
     # third get the info from the registry: two sources a) own nested already instantiated or 
@@ -365,7 +367,7 @@ def get_federated_network_info_reply(nsId, nsdId, domain):
                     networkInfo["cidr"][key] = reference_instance_record['cidr'][network]
                     networkInfo["addressPool"][key] = networkInfo["addressPool"][key] + reference_instance_record["addressPool"][network]
     log_queue.put(["INFO", "CROOE returns networkInfo through EWBI for nsId: %s and info: %s"%(nsId, networkInfo)])
-    log_queue.put(["INFO", "*****Time measure: CROOE CROOE finishes replying to get_federated_network_info"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finishes replying to get_federated_network_info"%(nsId)])
     return networkInfo
 
 def get_federated_network_instance_info_request(nsId, nsdId, domain, ewbi_port, ewbi_path):
@@ -423,7 +425,7 @@ def get_federated_network_instance_info_reply(nsId, nsdId, domain):
     InstanceInfo: dict
         return the information about used pools and IP addresses for the internested services
     """
-    log_queue.put(["INFO", "*****Time measure: CROOE CROOE starts replying to get_federated_network_instance_info"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE starts replying to get_federated_network_instance_info" %(nsId)])
     instanceInfo = {"ip":{}, "vlan":{}, "addressPool":{}}
     # first check that the nsId is referring to a nsdId like the one received
     nsdId = ns_db.get_nsdId(nsId)
@@ -453,7 +455,7 @@ def get_federated_network_instance_info_reply(nsId, nsdId, domain):
                         if netaddr.IPAddress(port["ip_address"]) in netaddr.IPNetwork(network_info['cidr'][network]):
                             instanceInfo["ip"][key].append([port["ip_address"], port["mac_address"]])
     log_queue.put(["INFO", "CROOE returns instanceInfo through EWBI for nsId: %s and info: %s"%(nsId, instanceInfo)])
-    log_queue.put(["INFO", "*****Time measure: CROOE CROOE finishes replying to get_federated_network_instance_info"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finishes replying to get_federated_network_instance_info" % (nsId)])
     return instanceInfo
 
 
@@ -483,6 +485,7 @@ def set_federated_internested_connections_request(nsId, nsdId, connected_vnfs, l
         connected_vnfs[key] = dumps(connected_vnfs[key])
         link_characteristics[key] = dumps(link_characteristics[key])
     ewbi_body = {"nsdId": nsdId, "connectedVNFs": connected_vnfs, "linkChar": link_characteristics}
+    # log_queue.put(["DEBUG", "We ask to the provider: %s"% (dumps(ewbi_body, indent=4))])
     try:
         conn = HTTPConnection(domain, ewbi_port)
         conn.request("POST", ewbi_uri, dumps(ewbi_body), headers)
@@ -497,6 +500,59 @@ def set_federated_internested_connections_request(nsId, nsdId, connected_vnfs, l
         log_queue.put(["ERROR", "the EWBI server of the federated domain is not running or the connection configuration is wrong"])
     return pathInfo['pathInfo']
 
+def determine_nested_connections_federated_reply(nsId, conn_vnfs, link_char, domain):
+    connected_vnfs = {}
+    nested_connections = {}
+    link_characteristics = {}
+    for key in conn_vnfs.keys():
+        connected_vnfs[key]= loads(conn_vnfs[key])
+        link_characteristics[key]= loads(link_char[key])
+        nested_connections[key] = {}
+        nested_connections[key]['pairs'] = []
+        nested_connections[key]['network'] = ""
+    vnf_info = nsir_db.get_vnf_deployed_info(nsId)
+    network_info = nsir_db.get_vim_networks_info(nsId)
+    for key in fed_domain.keys():
+        # log_queue.put(["DEBUG", "In CROOE DOMAIN la key es: %s "% (key)])
+        if (fed_domain[key] == domain): 
+            domain = key
+    # log_queue.put(["DEBUG", "In CROOE DOMAIN is: %s "% (domain)])
+    for key in connected_vnfs.keys():
+        for elem in connected_vnfs[key]:
+            elem_l = [elem[0][0], domain, elem[0][1]]
+            elem_f = []
+            for vnf in vnf_info:
+                for port in vnf['port_info']:
+                    if (port["ip_address"] == elem[1][0]):
+                        elem_f = [port["ip_address"], vnf["dc"], port["mac_address"]]
+                        for network in network_info['cidr'].keys():
+                            if netaddr.IPAddress(port["ip_address"]) in netaddr.IPNetwork(network_info['cidr'][network]):
+                                nested_connections[key]["network"] = network
+                        break
+                if elem_f:
+                    break
+            nested_connections[key]['pairs'].append([elem_f, elem_l])
+    # log_queue.put(["DEBUG", "In CROOE nested_connections: %s "% dumps(nested_connections, indent=4)])
+    # log_queue.put(["DEBUG", "In CROOE nested_connections: %s "% dumps(link_characteristics, indent=4)])
+    return [nested_connections, link_characteristics]
+
+def set_federated_internested_connections(nsId, nested_connections, link_characteristics, flag=None):
+    resources_federated = sbi.get_mtp_federated_resources()
+    resources_local = sbi.get_mtp_resources() 
+    total_resources = copy.deepcopy(resources_local)
+    for pops in resources_federated["NfviPops"]:
+        total_resources["NfviPops"].append(pops)
+    for ll in resources_federated["logicalLinkInterNfviPops"]:
+        total_resources["logicalLinkInterNfviPops"].append(ll)
+    # create connections like variable nested_connections
+    # determinate the provider domain
+
+    selected_links = simple_lsa (link_characteristics, total_resources, nested_connections)
+    vls_info = extract_vls_info_mtp(total_resources, selected_links)
+    if (flag == "update"):
+        eenet.update_vls(nsId, vls_info, [])
+    else:
+        eenet.deploy_vls(vls_info, nsId)
 
 def set_federated_internested_connections_reply(nsId, body, domain):
     """
@@ -515,7 +571,7 @@ def set_federated_internested_connections_reply(nsId, body, domain):
     InstanceInfo: dict
         return the information about used pools and IP addresses for the internested services
     """
-    log_queue.put(["INFO", "*****Time measure: CROOE CROOE starts stablishing connections form the provider to the consumer domain"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE starts stablishing connections form the provider to the consumer domain" %(nsId)])
     # first check that the nsId is referring to a nsdId like the one received
     nsdId = ns_db.get_nsdId(nsId)
     if not nsdId == nsdId:
@@ -524,46 +580,65 @@ def set_federated_internested_connections_reply(nsId, body, domain):
     connected_vnfs = {}
     link_characteristics = {}
     nested_connections = {}
-    for key in body.connected_vn_fs.keys():
-        connected_vnfs[key]= loads(body.connected_vn_fs[key])
-        link_characteristics[key]= loads(body.link_char[key])
-        nested_connections[key] = {}
-        nested_connections[key]['pairs'] = []
-        nested_connections[key]['network'] = ""
-    resources_federated = sbi.get_mtp_federated_resources()
-    resources_local = sbi.get_mtp_resources() 
-    total_resources = copy.deepcopy(resources_local)
-    for pops in resources_federated["NfviPops"]:
-        total_resources["NfviPops"].append(pops)
-    for ll in resources_federated["logicalLinkInterNfviPops"]:
-        total_resources["logicalLinkInterNfviPops"].append(ll)
-    # create connections like variable nested_connections
-    # determinate the provider domain
-    vnf_info = nsir_db.get_vnf_deployed_info(nsId)
-    network_info = nsir_db.get_vim_networks_info(nsId)
-    for key in fed_domain.keys():
-        if (fed_domain[key] == domain): 
-            domain = key
-    for key in connected_vnfs.keys():
-        for elem in connected_vnfs[key]:
-            elem_l = [elem[0][0], domain, elem[0][1]]
-            elem_f = []
-            for vnf in vnf_info:
-                for port in vnf['port_info']:
-                    if (port["ip_address"] == elem[1][0]):
-                        elem_f = [port["ip_address"], vnf["dc"], port["mac_address"]]
-                        for network in network_info['cidr'].keys():
-                            if netaddr.IPAddress(port["ip_address"]) in netaddr.IPNetwork(network_info['cidr'][network]):
-                                nested_connections[key]["network"] = network
-                        break
-                if elem_f:
-                    break
-            nested_connections[key]['pairs'].append([elem_f, elem_l])
-    selected_links = simple_lsa (link_characteristics, total_resources, nested_connections)
-    vls_info = extract_vls_info_mtp(total_resources, selected_links)
-    eenet.deploy_vls(vls_info, nsId)
-    log_queue.put(["INFO", "*****Time measure: CROOE CROOE finishes stablishing connections from the provider to the consumer domain"])
+    [nested_connections, link_characteristics] = determine_nested_connections_federated_reply (nsId, body.connected_vn_fs, body.link_char, domain)
+    set_federated_internested_connections(nsId, nested_connections, link_characteristics)
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finishes stablishing connections from the provider to the consumer domain" %(nsId)])
     return "OK"
+
+def update_federated_internested_connections_request(nsId, nsdId, connected_vnfs_add, connected_vnfs_remove, link_characteristics, domain, ewbi_port, ewbi_path): 
+
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE starts updating connections from the provider to the consumer domain" % (nsId)])
+    ewbi_uri = "http://" + domain + ":" + ewbi_port + ewbi_path + nsId + "/federated-internested-connections"
+    for key in connected_vnfs_add.keys():
+        # we assume that we have the same keys for the elements to add and the link characteristics
+        connected_vnfs_add[key] = dumps(connected_vnfs_add[key])
+        link_characteristics[key] = dumps(link_characteristics[key])
+    for key in connected_vnfs_remove.keys():
+        connected_vnfs_remove[key] = dumps(connected_vnfs_remove[key])
+
+    ewbi_body = {"nsdId": nsdId, "connectedVNFs_add": connected_vnfs_add, "connectedVNFs_del": connected_vnfs_remove,"linkChar": link_characteristics}
+    try:
+        conn = HTTPConnection(domain, ewbi_port)
+        conn.request("PUT", ewbi_uri, dumps(ewbi_body), headers)
+        # ask pa to calculate the placement - read response and close connection
+        conn.sock.settimeout(timeout2)
+        rsp = conn.getresponse()
+        pathInfo = rsp.read().decode('utf-8')
+        pathInfo = loads(pathInfo)
+        conn.close()
+    except ConnectionRefusedError:
+        # the EWBI server is not running or the connection configuration is wrong
+        log_queue.put(["ERROR", "the EWBI server of the federated domain is not running or the connection configuration is wrong"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE starts updated connections from the provider to the consumer domain"% (nsId)])
+    return pathInfo['updatedPathInfo']
+
+def update_federated_internested_connections_reply(nsId, body, domain):
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE starts updating SCALED connections from the provider to the consumer domain" % (nsId)])
+    # first check that the nsId is referring to a nsdId like the one received
+    nsdId = ns_db.get_nsdId(nsId)
+    if not nsdId == nsdId:
+        return 404
+    # second reconstruct the incoming datam ask for mtp federated resources and reformat it to pass to the appropriate functions
+    connected_vnfs = {}
+    link_characteristics = {}
+    nested_connections = {}
+    #maybe better remove first and then add
+    if body.connected_vn_fs_del:
+      # *--* we need to do so!! go through the vl to check the one we need to remove
+      # first, we need to do a loads
+      connected_vnfs_del = {}
+      for key in body.connected_vn_fs_del.keys():
+          connected_vnfs_del[key]= loads(body.connected_vn_fs_del[key])
+      deleting_connections(nsId, connected_vnfs_del)
+      log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE update (removed) SCALED connections from the provider to the consumer domain"% (nsId)])
+    if body.connected_vn_fs_add:
+        [nested_connections, link_characteristics] = determine_nested_connections_federated_reply (nsId, body.connected_vn_fs_add, body.link_char, domain) 
+        # be careful with this denomination of the body.connected_vn_fs_add variable
+        set_federated_internested_connections(nsId, nested_connections, link_characteristics, "update")
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE update (created) SCALED connections from the provider to the consumer domain"% (nsId)])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finishes stablishing SCALING connections from the provider to the consumer domain"% (nsId)])
+    return "OK"
+
 
 ############################################ CORE FUNCTIONS ########################################################
 
@@ -632,7 +707,7 @@ def mapping_composite_networks_to_nested_networks(nsId, composite_nsd_json, body
     renaming_networks: dict
         dictionary with the renaming of networks between composite and nested services due to a referenced service
     """
-    log_queue.put(["INFO", "*****Time measure: CROOE CROOE analysing composite NSD"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE analysing composite NSD"% (nsId)])
     mapping = {}
     map_tmp = {}
     flavourId = body.flavour_id
@@ -697,30 +772,13 @@ def mapping_composite_networks_to_nested_networks(nsId, composite_nsd_json, body
     nsir_db.set_network_mapping(mapping, nsId)
     if renaming_networks:
         nsir_db.set_network_renaming_mapping(renaming_networks,nsId)
-    log_queue.put(["INFO", "*****Time measure: CROOE CROOE finishing analysing composite NSD"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finishing analysing composite NSD" % (nsId)])
     return [mapping, renaming_networks]
 
-def connecting_nested_local_services(nsId, nsd_json, network_mapping, local_services, nested_ns_instance, renaming_networks):
-    """
-    This function recovers the info from the different local services of a composite service to interconnects those VNFs in different PoPs
-    Parameters
-    ----------
-    nsId: string
-        Identifier of the service
-    nsd_json: json
-        Json descriptor of the composite network service
-    network_mapping: dict
-        Dictionary on how the different nested network services are interconnected
-    local_services: dict
-        Dictionary with the list of nested services deployed locally
-    nested_ns_instance: list of dicts
-        each entry is of the type {nsd_name: instance_id}, references to other NS that are use to composite/federate
-    renaming_networks: dict
-        dict containing how the internested links have to be renamed upon an initial instance
-    Returns
-    -------
-    """
-    log_queue.put(["INFO", "*****Time measure: CROOE CROOE starting connecting nested local services"])
+# Composite NFV-NS scaling: decoupling the "connecting_nested_local_services" function in two
+
+def determine_nested_local_pairs(nsId, network_mapping, local_services, nested_ns_instance, renaming_networks):
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE starting determining interconnected nested local services"% (nsId)])
     nested_network = {}
     network_info = {}
     vnf_info = {}
@@ -787,17 +845,109 @@ def connecting_nested_local_services(nsId, nsd_json, network_mapping, local_serv
     # we only continue if 'pairs' of nested_connections has something to connect, otherwise we have finished
     nested_connections = purgue_nested_connections(nested_connections)
     log_queue.put(["INFO", "Nested connections between local nested NSs determined by CROOE: %s"%nested_connections])
-    if (nested_connections):
-        resources = sbi.get_mtp_resources()
-        info_links = extract_info_vls_nsd(nsd_json["nsd"], nested_connections.keys(), renaming_networks)
-        selected_links = simple_lsa (info_links, resources, nested_connections)
-        vls_info = extract_vls_info_mtp(resources, selected_links)
-        eenet.deploy_vls(vls_info, nsId)
-    log_queue.put(["INFO", "*****Time measure: CROOE CROOE finishing connecting nested local services"])
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finishing determining interconnected nested local services" %(nsId)])
+    return nested_connections
 
-def connecting_nested_federated_local_services(nsId, nsd_json, network_mapping, local_services, federated_services, nested_ns_instance, renaming_networks):
+def interconnecting_nested_local_pairs(nsId, nested_connections, nsd_json, renaming_networks, flag=None):
+    resources = sbi.get_mtp_resources()
+    info_links = extract_info_vls_nsd(nsd_json, nested_connections.keys(), renaming_networks)
+    selected_links = simple_lsa (info_links, resources, nested_connections)
+    vls_info = extract_vls_info_mtp(resources, selected_links)
+    if flag == "update":
+        log_queue.put(["DEBUG", "CROOE Updating internested local VLs after a scaling operation"])
+        eenet.update_vls(nsId, vls_info, [])
+    else:
+        log_queue.put(["DEBUG", "CROOE setting up internested local VLs in instantiation operation"])
+        eenet.deploy_vls(vls_info, nsId)
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finished connecting nested local services" % (nsId)])
+
+def update_connection_info(old_nested_local_connections, new_nested_local_connections):
+# we have the initial local connections and the new, we need to identify the pairs both to be created and
+# the pairs to be deleted. The output are two variables with the same structure of connections,
+    connections_to_add={}
+    connections_to_remove={}
+    # we compare the new with the old, if there is an element in the new that it is not in the old -> create
+    for vl_new in new_nested_local_connections.keys():
+        if vl_new not in old_nested_local_connections.keys():
+            # extreme case, complete new connections
+            connections_to_add[vl_new] = new_nested_local_connections[vl_new]
+        for vl_old in old_nested_local_connections.keys():
+            if (vl_new == vl_old):
+                new_connections = 0
+                for pair_new in new_nested_local_connections[vl_new]['pairs']:
+                    new_ip_addresses = [pair_new[0][0],pair_new[1][0]]
+                    found = 0
+                    for pair_old in old_nested_local_connections[vl_old]['pairs']:
+                        old_ip_addresses= [pair_old[0][0],pair_old[1][0]]
+                        if (new_ip_addresses[0] in old_ip_addresses and new_ip_addresses[1] in old_ip_addresses):
+                            found = 1
+                            break
+                    if (found == 0):
+                        if vl_new not in connections_to_add:
+                            connections_to_add[vl_new] = {}
+                            connections_to_add[vl_new]['pairs'] = []
+                        connections_to_add[vl_new]['pairs'].append(pair_new)
+                        new_connections = new_connections + 1
+                if (new_connections > 0):
+                    connections_to_add[vl_new]['network'] = new_nested_local_connections[vl_new]['network']
+    log_queue.put(["DEBUG", "CROOE determining new connections to add for a nested after a scaling operation: %s"%dumps(connections_to_add)])
+    # we compare the old with the new, if there is an element in the old that it is not in the new -> delete
+    for vl_old in old_nested_local_connections.keys():
+        if vl_old not in new_nested_local_connections.keys():
+            # extreme case, complete new connections
+            connections_to_remove[vl_old] = old_nested_local_connections[vl_old]
+        for vl_new in new_nested_local_connections.keys():
+            if (vl_old == vl_new):
+                old_connections = 0
+                for pair_old in old_nested_local_connections[vl_old]['pairs']:
+                    old_ip_addresses = [pair_old[0][0],pair_old[1][0]]
+                    found = 0
+                    for pair_new in new_nested_local_connections[vl_new]['pairs']:
+                        new_ip_addresses= [pair_new[0][0],pair_new[1][0]]
+                        if (old_ip_addresses[0] in new_ip_addresses and old_ip_addresses[1] in new_ip_addresses):
+                            found = 1
+                            break
+                    if (found == 0):
+                        if vl_old not in connections_to_remove:
+                            connections_to_remove[vl_old] = {}
+                            connections_to_remove[vl_old]['pairs'] = []
+                        connections_to_remove[vl_old]['pairs'].append(pair_old)
+                        old_connections = old_connections + 1
+                if (old_connections > 0):
+                    connections_to_remove[vl_old]['network'] = old_nested_local_connections[vl_old]['network']     
+    log_queue.put(["DEBUG", "CROOE determining old connections to be removed for a nested after a scaling operation: %s"% dumps(connections_to_remove)])
+    return [connections_to_add, connections_to_remove]
+
+def deleting_nested_local_connections(nsId, del_connections):
+    # del_connections is a variable containing 
+    current_vls = nsir_db.get_vls(nsId)
+    # log_queue.put(["DEBUG", "deleting nested local connections: %s"%current_vls])
+    # log_queue.put(["DEBUG", "deleting connections: %s"%del_connections])
+    ids_to_remove = []
+    # dummy variable for eenet.update_vls_method()
+    vl_list = {}
+    vl_list["logicalLinkPathList"] = []
+    for vl in del_connections:
+        for pair in del_connections[vl]["pairs"]:
+            pair_ip_addresses = [pair[0][0],pair[1][0]]
+            for ll in current_vls:
+                key = next(iter(ll))
+                vl_ip_addresses = []
+                for data in ll[key]["metaData"]:
+                    if (data["key"] == "srcVnfIpAddress" or data["key"] == "dstVnfIpAddress"):
+                        vl_ip_addresses.append(data["value"])
+                        if (len(vl_ip_addresses) == 2):
+                            break
+                if (pair_ip_addresses[0] in vl_ip_addresses and pair_ip_addresses[1] in vl_ip_addresses):
+                    # it means this ll has to be removed
+                    ids_to_remove.append(key)
+    if (len(ids_to_remove)>0):
+        eenet.update_vls(nsId, vl_list, ids_to_remove)
+
+
+def connecting_nested_local_services(nsId, nsd_json, network_mapping, local_services, nested_ns_instance, renaming_networks):
     """
-    This function recovers the info from the different nested services of a composite service to interconnects those VNFs in different domains
+    This function recovers the info from the different local services of a composite service to interconnects those VNFs in different PoPs
     Parameters
     ----------
     nsId: string
@@ -808,18 +958,55 @@ def connecting_nested_federated_local_services(nsId, nsd_json, network_mapping, 
         Dictionary on how the different nested network services are interconnected
     local_services: dict
         Dictionary with the list of nested services deployed locally
-    federated_services: dict
-        Dictionary with the list of nested services deployed in a federated domain
     nested_ns_instance: list of dicts
         each entry is of the type {nsd_name: instance_id}, references to other NS that are use to composite/federate
     renaming_networks: dict
-         dict with a correspondence between internested network and previously instantiated service
+        dict containing how the internested links have to be renamed upon an initial instance
     Returns
     -------
-    """  
-    log_queue.put(["INFO", "*****Time measure: CROOE CROOE starting interconnecting nested local with federated services"])
+    """
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE starting connecting nested local services" % (nsId)])
+    nested_connections = {}
+    nested_connections = determine_nested_local_pairs(nsId, network_mapping, local_services, nested_ns_instance, renaming_networks)
+    nsir_db.set_nested_local_connections(nested_connections, nsId)
+    log_queue.put(["DEBUG", "Nested connections decoupled and determined"])
+    if (nested_connections):
+        interconnecting_nested_local_pairs(nsId, nested_connections, nsd_json["nsd"], renaming_networks)
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finishing connecting nested local services" % (nsId)])
+
+def update_connecting_nested_local_services(nsId, nsd_json, local_services, nested_ns_instance):
+
+# nsId of the composite, nsd_json of the composite, local_il_nested has the info about localnested to be scaled, reference_il has the info about
+# the reference in case the composite is using a il (asuming the reference is always local)
+# we need network_mapping and renaming_networks
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE starting updating nested local services" % (nsId)])
+    network_mapping = nsir_db.get_network_mapping(nsId)
+    renaming_networks = nsir_db.get_renaming_network_mapping(nsId)
+    old_nested_local_connections = nsir_db.get_nested_local_connections(nsId)
+    log_queue.put(["DEBUG", "Old_connections CROOE SCALING: %s"%old_nested_local_connections])
+    new_nested_local_connections = determine_nested_local_pairs(nsId, network_mapping, local_services, nested_ns_instance, renaming_networks)
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE determined new set of nested local connected VNFs" % (nsId)])
+    log_queue.put(["DEBUG", "New_connections CROOE SCALING: %s"%new_nested_local_connections])
+    [new_connections, del_connections] = update_connection_info(old_nested_local_connections, new_nested_local_connections)
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finishing determining new_connections and connections to delete" % (nsId)])
+    # maybe better first remove connections to gain resources for the new connections 
+    if del_connections:
+        #here I will use the update vls of eenet but with empty vl_list
+        deleting_nested_local_connections(nsId, del_connections)
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finishing deleting connections" % (nsId)])
+    if new_connections:
+        interconnecting_nested_local_pairs(nsId, new_connections, nsd_json["nsd"], renaming_networks, "update")
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finishing creating new connections"% (nsId)])
+        
+    # update the local connections in the nsir_db entry
+    nsir_db.set_nested_local_connections(new_nested_local_connections, nsId)
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finishing updating nested local services" % (nsId)])
+
+# Composite NFV-NS scaling: refactoring this function, to make it more modular and reuse for scaling purposes
+def determine_federated_pairs(local_services, federated_services, nested_ns_instance):
     local_services_tmp = copy.deepcopy(local_services)
     for key in nested_ns_instance:
+        # assuming that nested_ns_instance is always local
         local_services_tmp.append({"nsd":key, "domain": "local"})
     # 1) There are to kind of pairs to be created a) local-federated pairs and b) federated-federated
     # For the moment, only implemented a), b) option is when you have more than one federated domain and
@@ -832,8 +1019,10 @@ def connecting_nested_federated_local_services(nsId, nsd_json, network_mapping, 
     for federated in federated_services:
         pairs_b.append(federated["nsd"])
     pairs_b = list(itertools.combinations(pairs_b, 2))
-    # 2) for each pair in pair_a
-    nested_connections_info_a = []
+    return [pairs_a, pairs_b]
+
+def determine_federated_local_connection_info(nsId, pairs_a, nested_ns_instance, network_mapping, renaming_networks):
+    nested_connections_info_a = [] 
     for pair in pairs_a:
         nested_connections_info_tmp = {}
         nested_connections_info_tmp['pair'] = pair
@@ -906,8 +1095,11 @@ def connecting_nested_federated_local_services(nsId, nsd_json, network_mapping, 
                                 if (local_nsir_record_network['cidr'][network] == str(cidr)):
                                     pair['vlan'][key3]['local'] = local_nsir_record_network['vlan_id'][network]
                             pair['vlan'][key3][domain] = nested_service_f["federatedInstanceInfo"]["instanceInfo"]["vlan"][key]
-    # now that we have the info, we need to invoke the request to the ewbi to create the connections towards the local domain
+    return nested_connections_info_a
+
+def connect_federate_local_pairs(nsId, nsd_json, nested_connections_info_a, nested_ns_instance):
     for pair in nested_connections_info_a:
+        # we connect local_nested- federation_nested basis operations
         connected_vnfs_f = {}
         connected_vnfs_l = {}
         link_characteristics = {}
@@ -926,20 +1118,301 @@ def connecting_nested_federated_local_services(nsId, nsd_json, network_mapping, 
             connected_vnfs_l[network] = ip_list_l
         # make connections at the federated domain 
         link_chars_tmp = copy.deepcopy(link_characteristics)
-        log_queue.put(["INFO", "*****Time measure: CROOE CROOE starts requesting connections from provider to consumer"])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE starts requesting connections from provider to consumer for pair %s" % (nsId, index)])
         result = set_federated_internested_connections_request(pair['nsId'][1][0], pair['pair'][1], connected_vnfs_f, 
                                                       link_chars_tmp, fed_domain[pair['nsId'][1][1]], ewbi_port, ewbi_path)
-        log_queue.put(["INFO", "*****Time measure: CROOE CROOE finish requesting connections from provider to consumer"])
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finished requesting connections from provider to consumer for pair %s" % (nsId, index)])
         if (result == "OK"):
             # it means that the paths have been established in the federated domain, now let's 
             # make the connections at the local domain
             # towards the federated one, with the vlan swapping
             # It is passed, the globla nsId, the local nsId in the provider domain, how vnf's connect, the characterisitic of the link and the vlan  
-            log_queue.put(["INFO", "*****Time measure: CROOE CROOE starts requesting connections from consumer to provider"])                 
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE starts requesting connections from consumer to provider for pair %s" % (nsId, index)])                 
             set_federated_internested_connections_local(nsId, pair['pair'][0], connected_vnfs_l, link_characteristics, pair['nsId'][1][1], swap_vlan, nested_ns_instance)
-            log_queue.put(["INFO", "*****Time measure: CROOE CROOE finish requesting connections from consumer to provider"]) 
-    log_queue.put(["INFO", "*****Time measure: CROOE CROOE finishing connecting nested local with federated services"])        
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finish requesting connections from consumer to provider" % (nsId, index)]) 
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finished connecting nested local with federated services" % (nsId)])        
     return
+
+def connecting_nested_federated_local_services(nsId, nsd_json, network_mapping, local_services, federated_services, nested_ns_instance, renaming_networks):
+    """
+    This function recovers the info from the different nested services of a composite service to interconnects those VNFs in different domains
+    Parameters
+    ----------
+    nsId: string
+        Identifier of the service
+    nsd_json: json
+        Json descriptor of the composite network service
+    network_mapping: dict
+        Dictionary on how the different nested network services are interconnected
+    local_services: dict
+        Dictionary with the list of nested services deployed locally
+    federated_services: dict
+        Dictionary with the list of nested services deployed in a federated domain
+    nested_ns_instance: list of dicts
+        each entry is of the type {nsd_name: instance_id}, references to other NS that are use to composite/federate
+    renaming_networks: dict
+         dict with a correspondence between internested network and previously instantiated service
+    Returns
+    -------
+    """  
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE starting interconnecting nested local with federated services" % (nsId)])
+    # 1) There are two kind of pairs to be created a) local-federated pairs and b) federated-federated
+    # For the moment, only implemented a), b) option is when you have more than one federated domain and
+    # you use the consumer/local domain to interconnect the federated domains between them
+    pairs_a = []
+    pairs_b = []
+    [pairs_a, pairs_b] = determine_federated_pairs(local_services, federated_services, nested_ns_instance)
+    # save them in ns_db
+    ns_db.set_federated_pairs(nsId, pairs_a, pairs_b)
+    # assuming that pairs_a are going to be present always
+    nested_connections_info_a = []
+    nested_connections_info_a = determine_federated_local_connection_info(nsId, pairs_a, nested_ns_instance, network_mapping, renaming_networks)
+    # update the info in the db
+    ns_db.set_nested_connections_local_federated(nsId, nested_connections_info_a)
+    connect_federate_local_pairs(nsId, nsd_json, nested_connections_info_a, nested_ns_instance)
+#    if (len(pairs_b)>0):
+#        nested_connections_info_b = [] # case not treated now
+#        nested_connections_info_b = determine_federated_federated_connection_info(nsId, pairs_b, network_mapping, renaming_networks) # case not treated now
+#        connect_federate_federate_pairs(nsId, nsd_json, nested_connections_info_b, nested_ns_instance)
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finishing interconnecting nested local with federated services" % (nsId)])
+    return
+
+def update_connecting_nested_federated_local_services(nsId, nsd_json, nested_ns_instance):
+    # we assume that when scaling a service will not dissapear
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE starting updating connections between 1)federated-local, 2)local-federated" % (nsId)])
+    network_mapping = nsir_db.get_network_mapping(nsId)
+    renaming_networks = nsir_db.get_renaming_network_mapping(nsId)   
+    pairs_a = []
+    pairs_b = []
+    [pairs_a, pairs_b] =  ns_db.get_federated_pairs(nsId)
+    nested_connections_info_a = []
+    nested_connections_info_a_old = ns_db.get_nested_connections_local_federated(nsId)
+    nested_connections_info_a = determine_federated_local_connection_info(nsId, pairs_a, nested_ns_instance, network_mapping, renaming_networks)
+    # update the info in the db
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE determined internested connections"% (nsId)])
+    ns_db.set_nested_connections_local_federated(nsId, nested_connections_info_a)
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE saved new internested connections in DB"% (nsId)])
+    update_connect_federate_local_pairs(nsId, nsd_json, nested_connections_info_a, nested_connections_info_a_old, nested_ns_instance)
+#     if (len(pairs_b)>0): # case not treated now
+#         nested_connections_info_b = []
+#         nested_connections_info_b_old = ns_db.get_nested_connections_federated_federated(nsId)
+#         nested_connections_info_b = determine_federated_federated_connection_info(nsId, pairs_b, network_mapping, renaming_networks) 
+#         update_connect_federate_federate_pairs(nsId, nsd_json, nested_connections_info_b, nested_connections_info_b_old, nested_ns_instance)
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finished updating connections between 1)federated-local, 2)local-federated" % (nsId)])
+    return
+
+
+##### functions supporting update_connecting_nested_federated_local_services
+
+def update_connect_federate_local_pairs(nsId, nsd_json, nested_connections_info_a, nested_connections_info_a_old, nested_ns_instance):
+    # we connect local_nested- federation_nested basis operations
+    log_queue.put(["DEBUG", "In CROOE NEW CONNECTIONS: %s"% dumps(nested_connections_info_a)])
+    log_queue.put(["DEBUG", "In CROOE OLD CONNECTIONS: %s"% dumps(nested_connections_info_a_old)])
+    
+    for pair in nested_connections_info_a:
+        nested_ids = []
+        nested_ids.append(pair['pair'][0])
+        nested_ids.append(pair['pair'][1])
+        connected_vnfs_f_new = {}
+        connected_vnfs_l_new = {}
+        link_characteristics = {}
+        swap_vlan = {}
+        for network in pair['ips'].keys():
+            ip_list_f = []
+            ip_list_l = []
+            swap_vlan[network] = pair['vlan'][network][pair['nsId'][1][1]]
+            link_info = extract_info_vls_nsd_simple(nsd_json["nsd"], network)
+            link_characteristics.update(link_info)
+            for ipl in pair['ips'][network][pair['nsId'][0][1]]:
+                for ipf in pair['ips'][network][pair['nsId'][1][1]]:
+                    ip_list_f.append([[ipl[0],ipl[2]],ipf])
+                    ip_list_l.append([ipl,[ipf[0],pair['nsId'][1][1],ipf[1]]])
+            connected_vnfs_f_new[network] = ip_list_f
+            connected_vnfs_l_new[network] = ip_list_l
+        # new for the scaling operation -> we generate the connected_vnfs_f and connected_vnfs_l for the previous situation
+        # *--* we need to compare to launch to create add, remove variables
+        # and then we compare and we launch the update operation on this
+        # make connections at the federated domain 
+        for pair_old in nested_connections_info_a_old:
+            if ((pair_old['pair'][0] in nested_ids) and (pair_old['pair'][1] in nested_ids)): 
+                # we are in the same pair
+                connected_vnfs_f_old = {}
+                connected_vnfs_l_old = {}
+                for network in pair_old['ips'].keys():
+                    ip_list_f = []
+                    ip_list_l = []
+                    for ipl in pair_old['ips'][network][pair_old['nsId'][0][1]]:
+                        for ipf in pair_old['ips'][network][pair_old['nsId'][1][1]]:
+                            ip_list_f.append([[ipl[0],ipl[2]],ipf])
+                            ip_list_l.append([ipl,[ipf[0],pair['nsId'][1][1],ipf[1]]])
+                    connected_vnfs_f_old[network] = ip_list_f
+                    connected_vnfs_l_old[network] = ip_list_l
+                break #we find our pair and we can exit the comparison
+        # now we compare, we need to remove from link and swap_vlan info the networks that are not in the "add variable"
+        # log_queue.put(["DEBUG", "CROOE connections FEDERATED processed OLD: %s"%dumps(connected_vnfs_f_old)])
+        # log_queue.put(["DEBUG", "CROOE connections FEDERATED processed NEW: %s"%dumps(connected_vnfs_f_new)])
+        # log_queue.put(["DEBUG", "CROOE connections LOCAL processed OLD: %s"%dumps(connected_vnfs_l_old)])
+        # log_queue.put(["DEBUG", "CROOE connections LOCAL processed NEW: %s"%dumps(connected_vnfs_l_new)])
+
+        [connected_vnfs_f_add, connected_vnfs_f_remove ] = comparing_federated_connections(connected_vnfs_f_old, connected_vnfs_f_new)
+        # log_queue.put(["DEBUG", "PROCESSING LOCAL connections"])
+        [connected_vnfs_l_add, connected_vnfs_l_remove ] = comparing_federated_connections(connected_vnfs_l_old, connected_vnfs_l_new)  
+        # log_queue.put(["DEBUG", "In CROOE UPDATING CONNECTIONS SCALING:"])
+        # log_queue.put(["DEBUG", "connections federated to add: %s"%dumps(connected_vnfs_f_add, indent=4)])
+        # log_queue.put(["DEBUG", "connections local to add: %s"%dumps(connected_vnfs_l_add, indent=4)])
+        # log_queue.put(["DEBUG", "connections federated to remove: %s"%dumps(connected_vnfs_f_remove, indent=4)])
+        # log_queue.put(["DEBUG", "connections local to remove: %s"%dumps(connected_vnfs_l_remove, indent=4)])
+
+        # log_queue.put(["DEBUG", "CROOE the link chars A are: %s"%link_characteristics])       
+        link_chars_tmp = copy.deepcopy(link_characteristics)
+        swap_vlan_tmp = copy.deepcopy(swap_vlan)
+        # log_queue.put(["DEBUG", "CROOE the link chars B are: %s"%link_chars_tmp])
+        for network in swap_vlan.keys():
+            if network not in connected_vnfs_f_add.keys():
+                del swap_vlan_tmp[network]
+                del link_chars_tmp[network]
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE starts requesting connections from provider to consumer" % (nsId)])
+        result = update_federated_internested_connections_request(pair['nsId'][1][0], pair['pair'][1], connected_vnfs_f_add, connected_vnfs_f_remove, 
+                                                      link_chars_tmp, fed_domain[pair['nsId'][1][1]], ewbi_port, ewbi_path)
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finish requesting connections from provider to consumer"% (nsId)])
+        if (result == "OK"):
+            # it means that the paths have been established in the federated domain, now let's 
+            # make the connections at the local domain
+            # towards the federated one, with the vlan swapping
+            # It is passed, the globla nsId, the local nsId in the provider domain, how vnf's connect, the characterisitic of the link and the vlan  
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE starts requesting connections from consumer to provider" % (nsId)])                 
+            update_federated_internested_connections_local(nsId, pair['pair'][0], connected_vnfs_l_add, connected_vnfs_l_remove, link_characteristics, pair['nsId'][1][1], swap_vlan_tmp, nested_ns_instance)           
+            log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finish requesting connections from consumer to provider" % (nsId)]) 
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finishing connecting nested local with federated services"% (nsId)])        
+    return
+
+def comparing_federated_connections(connected_vnfs_old, connected_vnfs_new):
+# we have the initial old and the new, we need to identify the pairs both to be created and
+# the pairs to be deleted. The output are two variables with the same structure of connections,
+    connections_to_add={}
+    connections_to_remove={}
+    # we compare the new with the old, if there is an element in the new that it is not in the old -> create
+    for vl_new in connected_vnfs_new.keys():
+        # log_queue.put(["DEBUG", "CRROOOOEEEE vl_new key: %s"%vl_new])
+        if vl_new not in connected_vnfs_old.keys():
+            # extreme case, complete new connections
+            connections_to_add[vl_new] = connected_vnfs_new[vl_new]
+        for vl_old in connected_vnfs_old.keys():
+            # log_queue.put(["DEBUG", "CRROOOOEEEE vl_old key: %s"%vl_old])
+            if (vl_new == vl_old):
+                new_connections = 0
+                for pair_new in connected_vnfs_new[vl_new]:
+                    new_ip_addresses = [pair_new[0][0],pair_new[1][0]]
+                    found = 0
+                    for pair_old in connected_vnfs_old[vl_old]:
+                        old_ip_addresses= [pair_old[0][0],pair_old[1][0]]
+                        if ( (new_ip_addresses[0] in old_ip_addresses) and (new_ip_addresses[1] in old_ip_addresses)):
+                            found = 1
+                            # log_queue.put(["DEBUG", "Found pair not to add, new: %s, old: %s"%(new_ip_addresses, old_ip_addresses)])
+                            break
+                    if (found == 0):
+                        if vl_new not in connections_to_add:
+                            connections_to_add[vl_new] = []
+                        connections_to_add[vl_new].append(pair_new)
+                        new_connections = new_connections + 1
+    log_queue.put(["DEBUG", "CROOE determining new connections PROVIDER-CONSUMER to add for a nested after a scaling operation: %s"%dumps(connections_to_add)])
+    # we compare the old with the new, if there is an element in the old that it is not in the new -> delete
+    for vl_old in connected_vnfs_old.keys():
+        if vl_old not in connected_vnfs_new.keys():
+            # extreme case, complete new connections
+            connections_to_remove[vl_old] = connected_vnfs_old[vl_old]
+        for vl_new in connected_vnfs_new.keys():
+            if (vl_old == vl_new):
+                old_connections = 0
+                for pair_old in connected_vnfs_old[vl_old]:
+                    old_ip_addresses = [pair_old[0][0],pair_old[1][0]]
+                    found = 0
+                    for pair_new in connected_vnfs_new[vl_new]:
+                        new_ip_addresses= [pair_new[0][0],pair_new[1][0]]
+                        if ((old_ip_addresses[0] in new_ip_addresses) and (old_ip_addresses[1] in new_ip_addresses)):
+                            found = 1
+                            break
+                    if (found == 0):
+                        if vl_old not in connections_to_remove:
+                            connections_to_remove[vl_old] = []
+                        connections_to_remove[vl_old].append(pair_old)
+                        old_connections = old_connections + 1
+    log_queue.put(["DEBUG", "CROOE determining old connections PROVIDER-CONSUMER to be removed for a nested after a scaling operation: %s"% dumps(connections_to_remove)])
+    return [connections_to_add, connections_to_remove]
+
+def deleting_connections(nsId, del_connections):
+    # del_connections is a variable containing 
+    current_vls = nsir_db.get_vls(nsId)
+    # log_queue.put(["DEBUG", "deleting nested local connections: %s"%current_vls])
+    # log_queue.put(["DEBUG", "deleting connections: %s"%del_connections])
+    ids_to_remove = []
+    # dummy variable for eenet.update_vls_method()
+    vl_list = {}
+    vl_list["logicalLinkPathList"] = []
+    for vl in del_connections:
+        for pair in del_connections[vl]:
+            pair_ip_addresses = [pair[0][0],pair[1][0]]
+            for ll in current_vls:
+                key = next(iter(ll))
+                vl_ip_addresses = []
+                for data in ll[key]["metaData"]:
+                    if (data["key"] == "srcVnfIpAddress" or data["key"] == "dstVnfIpAddress"):
+                        vl_ip_addresses.append(data["value"])
+                        if (len(vl_ip_addresses) == 2):
+                            break
+                if (pair_ip_addresses[0] in vl_ip_addresses and pair_ip_addresses[1] in vl_ip_addresses):
+                    # it means this ll has to be removed
+                    ids_to_remove.append(key)
+    if (len(ids_to_remove)>0):
+        eenet.update_vls(nsId, vl_list, ids_to_remove)
+
+    
+########################################
+# def connecting_nested_federated_local_services(nsId, nsd_json, network_mapping, local_services, federated_services, nested_ns_instance, renaming_networks):
+# refactored function to see if we can reuse code for scaling process
+########################################
+
+def determine_federated_nested_connections_local(nsId, nsdId, connected_vnfs, nested_ns_instance, swap_vlan):
+    nested_connections = {}
+    if nsdId in nested_ns_instance:
+        vnf_info = nsir_db.get_vnf_deployed_info(nested_ns_instance[nsdId])
+        network_info = nsir_db.get_vim_networks_info(nested_ns_instance[nsdId])
+    else:
+        vnf_info = nsir_db.get_vnf_deployed_info(nsId + '_' + nsdId)
+        network_info = nsir_db.get_vim_networks_info(nsId + '_' + nsdId)
+    nested_connections = {}
+    for key in connected_vnfs.keys():
+        nested_connections[key] = {}
+        ip_local = connected_vnfs[key][0][0][0] #example of ip, to look for the network name
+        nested_connections[key]['network'] = ""
+        for network in network_info['cidr'].keys():
+            if netaddr.IPAddress(ip_local) in netaddr.IPNetwork(network_info['cidr'][network]):
+                nested_connections[key]['network'] = network
+        nested_connections[key]['pairs'] = []
+        nested_connections[key]['vlanId'] = swap_vlan[key]
+        for elem in connected_vnfs[key]:
+            nested_connections[key]['pairs'].append([elem[0], elem[1]])
+    return nested_connections
+
+def set_connections_local_federated_internested(nsId, nested_connections, link_characteristics, flag=None):
+    resources_federated = sbi.get_mtp_federated_resources()
+    resources_local = sbi.get_mtp_resources() 
+    total_resources = copy.deepcopy(resources_local)
+    for pops in resources_federated["NfviPops"]:
+        total_resources["NfviPops"].append(pops)
+    for ll in resources_federated["logicalLinkInterNfviPops"]:
+        total_resources["logicalLinkInterNfviPops"].append(ll)
+    # create connections like variable nested_connections
+    # determinate the provider domain
+
+    selected_links = simple_lsa(link_characteristics, total_resources, nested_connections)
+    vls_info = extract_vls_info_mtp(total_resources, selected_links)
+    if (flag == "update"):
+        eenet.update_vls(nsId, vls_info, [])
+    else:
+        eenet.deploy_vls(vls_info, nsId)
+        
+
 
 def set_federated_internested_connections_local(nsId, nsdId, connected_vnfs, link_characteristics, domain, swap_vlan, nested_ns_instance):
     """
@@ -963,38 +1436,24 @@ def set_federated_internested_connections_local(nsId, nsdId, connected_vnfs, lin
     Returns
     -------
     """
-    log_queue.put(["INFO", "*****Time measure: CROOE CROOE starts requesting connections from consumer to provider"]) 
-    resources_federated = sbi.get_mtp_federated_resources()
-    resources_local = sbi.get_mtp_resources() 
-    total_resources = copy.deepcopy(resources_local)
-    for pops in resources_federated["NfviPops"]:
-        total_resources["NfviPops"].append(pops)
-    for ll in resources_federated["logicalLinkInterNfviPops"]:
-        total_resources["logicalLinkInterNfviPops"].append(ll)
-    # create connections like variable nested_connections
-    # determinate the provider domain
-    if nsdId in nested_ns_instance:
-        vnf_info = nsir_db.get_vnf_deployed_info(nested_ns_instance[nsdId])
-        network_info = nsir_db.get_vim_networks_info(nested_ns_instance[nsdId])
-    else:
-        vnf_info = nsir_db.get_vnf_deployed_info(nsId + '_' + nsdId)
-        network_info = nsir_db.get_vim_networks_info(nsId + '_' + nsdId)
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE starts requesting connections from consumer to provider"% (nsId)]) 
     nested_connections = {}
-    for key in connected_vnfs.keys():
-        nested_connections[key] = {}
-        ip_local = connected_vnfs[key][0][0][0] #example of ip, to look for the network name
-        nested_connections[key]['network'] = ""
-        for network in network_info['cidr'].keys():
-            if netaddr.IPAddress(ip_local) in netaddr.IPNetwork(network_info['cidr'][network]):
-                nested_connections[key]['network'] = network
-        nested_connections[key]['pairs'] = []
-        nested_connections[key]['vlanId'] = swap_vlan[key]
-        for elem in connected_vnfs[key]:
-            nested_connections[key]['pairs'].append([elem[0], elem[1]])
-    selected_links = simple_lsa(link_characteristics, total_resources, nested_connections)
-    vls_info = extract_vls_info_mtp(total_resources, selected_links)
-    eenet.deploy_vls(vls_info, nsId)
+    nested_connections = determine_federated_nested_connections_local(nsId, nsdId, connected_vnfs, nested_ns_instance, swap_vlan)
+    set_connections_local_federated_internested(nsId, nested_connections, link_characteristics)
     log_queue.put(["INFO", "*****Time measure: CROOE CROOE finishes requesting connections from consumer to provider"]) 
+
+def update_federated_internested_connections_local(nsId, nsdId, connected_vnfs_add, connected_vnfs_remove, link_characteristics, domain, swap_vlan, nested_ns_instance):
+   log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE starts updating SCALING connections from consumer to provider"% (nsId)]) 
+   if (connected_vnfs_remove):
+       #*--*identify logical links to see which you have to remove
+       deleting_connections(nsId, connected_vnfs_remove)
+       log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE removed connections from consumer to provider"% (nsId)])
+   if (connected_vnfs_add):
+       nested_connections = {}
+       nested_connections = determine_federated_nested_connections_local(nsId, nsdId, connected_vnfs_add, nested_ns_instance,swap_vlan)
+       set_connections_local_federated_internested(nsId, nested_connections, link_characteristics, "update")
+       log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE created connections from consumer to provider" % (nsId)])
+   log_queue.put(["INFO", "*****Time measure: CROOE CROOE finishes updating SCALING connections from consumer to provider"]) 
 
 def remove_nested_connections(nsId):
     """
@@ -1006,9 +1465,11 @@ def remove_nested_connections(nsId):
     Returns
     -------
     """
+    log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE starts removing internested connections consumer-provider" % (nsId)])
     log_queue.put(["INFO", "CROOE module removing nested connections"])
     if nsir_db.exists_nsir(nsId):
         # ask network execution engine to deploy the virtual links
         eenet.uninstall_vls(nsId)
         # remove the information from the nsir
         nsir_db.delete_nsir_record(nsId)
+        log_queue.put(["INFO", "*****Time measure for nsId: %s: CROOE CROOE finishes removing internested connections consumer-provider"% (nsId)])
